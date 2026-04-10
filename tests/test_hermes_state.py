@@ -4,7 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
-from hermes_state import SessionDB
+from hermes_state import AccountingDB, SessionDB
 
 
 @pytest.fixture()
@@ -14,6 +14,342 @@ def db(tmp_path):
     session_db = SessionDB(db_path=db_path)
     yield session_db
     session_db.close()
+
+
+@pytest.fixture()
+def accounting_db(tmp_path):
+    """Create an AccountingDB with a temp ledger file."""
+    db_path = tmp_path / "accounting.db"
+    ledger = AccountingDB(db_path=db_path)
+    yield ledger
+    ledger.close()
+
+
+# =========================================================================
+# Global accounting ledger
+# =========================================================================
+
+class TestAccountingLedger:
+    def test_creates_agent_runs_and_usage_events_tables(self, accounting_db):
+        with accounting_db._lock:
+            tables = {
+                row["name"]
+                for row in accounting_db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+        assert "agent_runs" in tables
+        assert "usage_events" in tables
+
+    def test_create_and_end_agent_run(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="run-root",
+            root_run_id="run-root",
+            parent_run_id=None,
+            local_session_id="session-1",
+            home_id="default",
+            profile_name=None,
+            launch_kind="root",
+            transport_kind="direct",
+            source="cli",
+            model_hint="gpt-5.4",
+            provider_hint="openai",
+            base_url_hint="https://api.openai.com/v1",
+            metadata={"purpose": "test"},
+        )
+
+        run = accounting_db.get_agent_run("run-root")
+        assert run is not None
+        assert run["run_id"] == "run-root"
+        assert run["root_run_id"] == "run-root"
+        assert run["parent_run_id"] is None
+        assert run["launch_kind"] == "root"
+        assert run["transport_kind"] == "direct"
+        assert run["metadata_json"] == {"purpose": "test"}
+        assert isinstance(run["started_at"], float)
+        assert run["ended_at"] is None
+
+        accounting_db.end_agent_run("run-root")
+        ended = accounting_db.get_agent_run("run-root")
+        assert isinstance(ended["ended_at"], float)
+
+    def test_append_usage_event_round_trips_structured_fields(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="run-child",
+            root_run_id="run-root",
+            parent_run_id="run-root",
+            local_session_id="session-child",
+            home_id="default",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+        )
+
+        accounting_db.append_usage_event(
+            run_id="run-child",
+            root_run_id="run-root",
+            home_id="default",
+            profile_name="worker",
+            local_session_id="session-child",
+            provider="anthropic",
+            base_url="https://openrouter.ai/api/v1",
+            model="anthropic/claude-sonnet-4",
+            api_mode="responses",
+            input_tokens=123,
+            output_tokens=45,
+            cache_read_tokens=6,
+            cache_write_tokens=7,
+            reasoning_tokens=8,
+            estimated_cost_usd=0.42,
+            usage_status="exact",
+            request_fingerprint="req-1",
+            metadata={"slice": 1},
+        )
+
+        events = accounting_db.get_usage_events(run_id="run-child")
+        assert len(events) == 1
+        event = events[0]
+        assert event["run_id"] == "run-child"
+        assert event["root_run_id"] == "run-root"
+        assert event["provider"] == "anthropic"
+        assert event["model"] == "anthropic/claude-sonnet-4"
+        assert event["input_tokens"] == 123
+        assert event["output_tokens"] == 45
+        assert event["cache_read_tokens"] == 6
+        assert event["cache_write_tokens"] == 7
+        assert event["reasoning_tokens"] == 8
+        assert event["usage_status"] == "exact"
+        assert event["metadata_json"] == {"slice": 1}
+        assert isinstance(event["recorded_at"], float)
+
+    def test_get_usage_events_filters_by_root_run_id(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="run-a",
+            root_run_id="root-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        accounting_db.create_agent_run(
+            run_id="run-b",
+            root_run_id="root-b",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        accounting_db.append_usage_event(
+            run_id="run-a",
+            root_run_id="root-a",
+            home_id="default",
+            input_tokens=10,
+            output_tokens=1,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="run-b",
+            root_run_id="root-b",
+            home_id="default",
+            input_tokens=20,
+            output_tokens=2,
+            usage_status="exact",
+        )
+
+        events = accounting_db.get_usage_events(root_run_id="root-a")
+        assert len(events) == 1
+        assert events[0]["run_id"] == "run-a"
+
+    def test_get_task_usage_summary_returns_manager_worker_and_total(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run",
+            root_run_id="root-run",
+            parent_run_id="root-run",
+            home_id="default",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            provider="openai-codex",
+            model="gpt-5.4",
+            input_tokens=100,
+            output_tokens=10,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="child-run",
+            root_run_id="root-run",
+            home_id="default",
+            profile_name="worker",
+            provider="custom",
+            model="local-model",
+            input_tokens=40,
+            output_tokens=4,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="child-run",
+            root_run_id="root-run",
+            home_id="default",
+            profile_name="worker",
+            provider="custom",
+            model="local-model",
+            input_tokens=0,
+            output_tokens=0,
+            usage_status="unknown",
+        )
+
+        summary = accounting_db.get_task_usage_summary("root-run")
+        assert summary["root_run_id"] == "root-run"
+        assert summary["manager_only"]["input_tokens"] == 100
+        assert summary["manager_only"]["output_tokens"] == 10
+        assert summary["worker_only"]["input_tokens"] == 40
+        assert summary["worker_only"]["output_tokens"] == 4
+        assert summary["total"]["input_tokens"] == 140
+        assert summary["total"]["output_tokens"] == 14
+        assert summary["exact_event_count"] == 2
+        assert summary["unknown_event_count"] == 1
+        assert summary["child_run_count"] == 1
+
+    def test_get_task_usage_breakdown_groups_by_route_fields(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.4",
+            input_tokens=100,
+            output_tokens=10,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            provider="custom",
+            base_url="http://superbif:8000/v1",
+            model="google/gemma-4-26B-A4B-it",
+            profile_name="worker",
+            input_tokens=40,
+            output_tokens=4,
+            usage_status="unknown",
+        )
+
+        rows = accounting_db.get_task_usage_breakdown("root-run")
+        assert len(rows) == 2
+        by_provider = {row["provider"]: row for row in rows}
+        assert by_provider["openai-codex"]["input_tokens"] == 100
+        assert by_provider["openai-codex"]["exact_event_count"] == 1
+        assert by_provider["custom"]["unknown_event_count"] == 1
+        assert by_provider["custom"]["base_url"] == "http://superbif:8000/v1"
+
+    def test_get_task_run_tree_returns_runs_for_root(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            source="cli",
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run",
+            root_run_id="root-run",
+            parent_run_id="root-run",
+            home_id="default",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+            source="cli",
+        )
+
+        tree = accounting_db.get_task_run_tree("root-run")
+        assert [row["run_id"] for row in tree] == ["root-run", "child-run"]
+        assert tree[1]["parent_run_id"] == "root-run"
+        assert tree[1]["transport_kind"] == "acp"
+
+    def test_get_task_session_links_maps_run_to_session_lineage(self, accounting_db, db):
+        db.create_session(session_id="session-a", source="cli")
+        db.create_session(session_id="session-b", source="cli", parent_session_id="session-a")
+        accounting_db.create_agent_run(
+            run_id="root-run",
+            root_run_id="root-run",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run",
+            root_run_id="root-run",
+            parent_run_id="root-run",
+            local_session_id="session-b",
+            home_id="default",
+            launch_kind="delegate_task",
+            transport_kind="direct",
+        )
+
+        links = accounting_db.get_task_session_links("root-run", session_db=db)
+        assert len(links) == 2
+        assert links[0]["local_session_id"] == "session-a"
+        assert links[0]["parent_session_id"] is None
+        assert links[1]["local_session_id"] == "session-b"
+        assert links[1]["parent_session_id"] == "session-a"
+
+    def test_get_task_provenance_warnings_reports_unknown_and_missing_session_rows(self, accounting_db, db):
+        db.create_session(session_id="session-a", source="cli")
+        accounting_db.create_agent_run(
+            run_id="root-run",
+            root_run_id="root-run",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run",
+            root_run_id="root-run",
+            parent_run_id="root-run",
+            local_session_id="missing-session",
+            home_id="worker",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+        )
+        accounting_db.append_usage_event(
+            run_id="child-run",
+            root_run_id="root-run",
+            home_id="worker",
+            profile_name="worker",
+            provider="custom",
+            model="local-model",
+            input_tokens=0,
+            output_tokens=0,
+            usage_status="unknown",
+        )
+
+        warnings = accounting_db.get_task_provenance_warnings("root-run", session_db=db)
+        warning_types = {w["type"] for w in warnings}
+        assert "unknown_usage" in warning_types
+        assert "missing_session_link" in warning_types
 
 
 # =========================================================================

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+DEFAULT_ACCOUNTING_DB_PATH = get_hermes_home() / "accounting.db"
 
 SCHEMA_VERSION = 6
 
@@ -110,6 +111,422 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
 """
+
+
+ACCOUNTING_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS agent_runs (
+    run_id TEXT PRIMARY KEY,
+    parent_run_id TEXT,
+    root_run_id TEXT NOT NULL,
+    local_session_id TEXT,
+    home_id TEXT NOT NULL,
+    profile_name TEXT,
+    launch_kind TEXT NOT NULL,
+    transport_kind TEXT NOT NULL,
+    source TEXT,
+    model_hint TEXT,
+    provider_hint TEXT,
+    base_url_hint TEXT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_runs_root ON agent_runs(root_run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_parent ON agent_runs(parent_run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_home_profile ON agent_runs(home_id, profile_name);
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    root_run_id TEXT NOT NULL,
+    home_id TEXT NOT NULL,
+    profile_name TEXT,
+    local_session_id TEXT,
+    provider TEXT,
+    base_url TEXT,
+    model TEXT,
+    api_mode TEXT,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL,
+    usage_status TEXT NOT NULL,
+    recorded_at REAL NOT NULL,
+    request_fingerprint TEXT,
+    metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_events_run ON usage_events(run_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_root ON usage_events(root_run_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_home_profile ON usage_events(home_id, profile_name, event_id);
+"""
+
+
+class AccountingDB:
+    """Global ledger DB for attributable runs and exact usage events."""
+
+    _WRITE_MAX_RETRIES = 15
+    _WRITE_RETRY_MIN_S = 0.020
+    _WRITE_RETRY_MAX_S = 0.150
+    _CHECKPOINT_EVERY_N_WRITES = 50
+
+    def __init__(self, db_path: Path = None):
+        self.db_path = db_path or DEFAULT_ACCOUNTING_DB_PATH
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._write_count = 0
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.executescript(ACCOUNTING_SCHEMA_SQL)
+        self._conn.commit()
+
+    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        last_err: Optional[Exception] = None
+        for attempt in range(self._WRITE_MAX_RETRIES):
+            try:
+                with self._lock:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        result = fn(self._conn)
+                        self._conn.commit()
+                    except BaseException:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+                        raise
+                self._write_count += 1
+                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
+                    self._try_wal_checkpoint()
+                return result
+            except sqlite3.OperationalError as exc:
+                err_msg = str(exc).lower()
+                if "locked" in err_msg or "busy" in err_msg:
+                    last_err = exc
+                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                        jitter = random.uniform(self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S)
+                        time.sleep(jitter)
+                        continue
+                raise
+        raise last_err or sqlite3.OperationalError("database is locked after max retries")
+
+    def _try_wal_checkpoint(self) -> None:
+        try:
+            with self._lock:
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
+    def close(self):
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception:
+                    pass
+                self._conn.close()
+                self._conn = None
+
+    @staticmethod
+    def _decode_json(value: Optional[str]) -> Any:
+        if not value:
+            return None
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return value
+
+    def create_agent_run(
+        self,
+        *,
+        run_id: str,
+        root_run_id: str,
+        parent_run_id: str = None,
+        local_session_id: str = None,
+        home_id: str,
+        profile_name: str = None,
+        launch_kind: str,
+        transport_kind: str,
+        source: str = None,
+        model_hint: str = None,
+        provider_hint: str = None,
+        base_url_hint: str = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        started_at = time.time()
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO agent_runs (
+                       run_id, parent_run_id, root_run_id, local_session_id,
+                       home_id, profile_name, launch_kind, transport_kind,
+                       source, model_hint, provider_hint, base_url_hint,
+                       started_at, ended_at, metadata_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT ended_at FROM agent_runs WHERE run_id = ?), NULL), ?)""",
+                (
+                    run_id,
+                    parent_run_id,
+                    root_run_id,
+                    local_session_id,
+                    home_id,
+                    profile_name,
+                    launch_kind,
+                    transport_kind,
+                    source,
+                    model_hint,
+                    provider_hint,
+                    base_url_hint,
+                    started_at,
+                    run_id,
+                    metadata_json,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def end_agent_run(self, run_id: str) -> None:
+        ended_at = time.time()
+        self._execute_write(lambda conn: conn.execute("UPDATE agent_runs SET ended_at = ? WHERE run_id = ?", (ended_at, run_id)))
+
+    def get_agent_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM agent_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["metadata_json"] = self._decode_json(result.get("metadata_json"))
+        return result
+
+    def append_usage_event(
+        self,
+        *,
+        run_id: str,
+        root_run_id: str,
+        home_id: str,
+        profile_name: str = None,
+        local_session_id: str = None,
+        provider: str = None,
+        base_url: str = None,
+        model: str = None,
+        api_mode: str = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        usage_status: str = "exact",
+        request_fingerprint: str = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        recorded_at = time.time()
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO usage_events (
+                       run_id, root_run_id, home_id, profile_name, local_session_id,
+                       provider, base_url, model, api_mode,
+                       input_tokens, output_tokens, cache_read_tokens,
+                       cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+                       usage_status, recorded_at, request_fingerprint, metadata_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    root_run_id,
+                    home_id,
+                    profile_name,
+                    local_session_id,
+                    provider,
+                    base_url,
+                    model,
+                    api_mode,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    estimated_cost_usd,
+                    usage_status,
+                    recorded_at,
+                    request_fingerprint,
+                    metadata_json,
+                ),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def get_usage_events(self, *, run_id: str = None, root_run_id: str = None) -> List[Dict[str, Any]]:
+        clauses = []
+        params: List[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if root_run_id is not None:
+            clauses.append("root_run_id = ?")
+            params.append(root_run_id)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM usage_events {where_sql} ORDER BY event_id ASC",
+                tuple(params),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["metadata_json"] = self._decode_json(item.get("metadata_json"))
+            results.append(item)
+        return results
+
+    def get_task_run_tree(self, root_run_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM agent_runs WHERE root_run_id = ? ORDER BY started_at ASC, run_id ASC",
+                (root_run_id,),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["metadata_json"] = self._decode_json(item.get("metadata_json"))
+            results.append(item)
+        return results
+
+    @staticmethod
+    def _sum_usage_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        }
+        for row in rows:
+            totals["input_tokens"] += int(row.get("input_tokens") or 0)
+            totals["output_tokens"] += int(row.get("output_tokens") or 0)
+            totals["cache_read_tokens"] += int(row.get("cache_read_tokens") or 0)
+            totals["cache_write_tokens"] += int(row.get("cache_write_tokens") or 0)
+            totals["reasoning_tokens"] += int(row.get("reasoning_tokens") or 0)
+            totals["estimated_cost_usd"] += float(row.get("estimated_cost_usd") or 0.0)
+        return totals
+
+    def get_task_usage_summary(self, root_run_id: str) -> Dict[str, Any]:
+        runs = self.get_task_run_tree(root_run_id)
+        events = self.get_usage_events(root_run_id=root_run_id)
+        root_run_ids = {r["run_id"] for r in runs if r.get("parent_run_id") is None and r.get("run_id") == root_run_id}
+        manager_events = [e for e in events if e.get("run_id") in root_run_ids]
+        worker_events = [e for e in events if e.get("run_id") not in root_run_ids]
+        exact_count = sum(1 for e in events if e.get("usage_status") == "exact")
+        unknown_count = sum(1 for e in events if e.get("usage_status") != "exact")
+        timestamps = [float(e.get("recorded_at")) for e in events if e.get("recorded_at") is not None]
+        return {
+            "root_run_id": root_run_id,
+            "manager_only": self._sum_usage_rows(manager_events),
+            "worker_only": self._sum_usage_rows(worker_events),
+            "total": self._sum_usage_rows(events),
+            "exact_event_count": exact_count,
+            "unknown_event_count": unknown_count,
+            "first_event_at": min(timestamps) if timestamps else None,
+            "last_event_at": max(timestamps) if timestamps else None,
+            "child_run_count": sum(1 for r in runs if r.get("parent_run_id") is not None),
+        }
+
+    def get_task_usage_breakdown(self, root_run_id: str) -> List[Dict[str, Any]]:
+        events = self.get_usage_events(root_run_id=root_run_id)
+        runs_by_id = {r["run_id"]: r for r in self.get_task_run_tree(root_run_id)}
+        grouped: Dict[tuple, Dict[str, Any]] = {}
+        for e in events:
+            run = runs_by_id.get(e.get("run_id"), {})
+            key = (
+                e.get("provider"),
+                e.get("base_url"),
+                e.get("model"),
+                e.get("profile_name"),
+                e.get("home_id"),
+                run.get("launch_kind"),
+                run.get("transport_kind"),
+                e.get("run_id"),
+            )
+            row = grouped.setdefault(key, {
+                "provider": e.get("provider"),
+                "base_url": e.get("base_url"),
+                "model": e.get("model"),
+                "profile_name": e.get("profile_name"),
+                "home_id": e.get("home_id"),
+                "launch_kind": run.get("launch_kind"),
+                "transport_kind": run.get("transport_kind"),
+                "run_id": e.get("run_id"),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "exact_event_count": 0,
+                "unknown_event_count": 0,
+            })
+            row["input_tokens"] += int(e.get("input_tokens") or 0)
+            row["output_tokens"] += int(e.get("output_tokens") or 0)
+            row["cache_read_tokens"] += int(e.get("cache_read_tokens") or 0)
+            row["cache_write_tokens"] += int(e.get("cache_write_tokens") or 0)
+            row["reasoning_tokens"] += int(e.get("reasoning_tokens") or 0)
+            row["estimated_cost_usd"] += float(e.get("estimated_cost_usd") or 0.0)
+            if e.get("usage_status") == "exact":
+                row["exact_event_count"] += 1
+            else:
+                row["unknown_event_count"] += 1
+        return list(grouped.values())
+
+    def get_task_session_links(self, root_run_id: str, *, session_db=None) -> List[Dict[str, Any]]:
+        links = []
+        for run in self.get_task_run_tree(root_run_id):
+            local_session_id = run.get("local_session_id")
+            parent_session_id = None
+            if session_db is not None and local_session_id:
+                session = session_db.get_session(local_session_id)
+                if session:
+                    parent_session_id = session.get("parent_session_id")
+            links.append({
+                "run_id": run.get("run_id"),
+                "root_run_id": run.get("root_run_id"),
+                "local_session_id": local_session_id,
+                "parent_session_id": parent_session_id,
+                "session_rotated": parent_session_id is not None,
+            })
+        return links
+
+    def get_task_provenance_warnings(self, root_run_id: str, *, session_db=None) -> List[Dict[str, Any]]:
+        warnings: List[Dict[str, Any]] = []
+        events = self.get_usage_events(root_run_id=root_run_id)
+        if any(e.get("usage_status") != "exact" for e in events):
+            warnings.append({
+                "type": "unknown_usage",
+                "root_run_id": root_run_id,
+                "message": "One or more usage events are non-exact and should be treated cautiously.",
+            })
+        if session_db is not None:
+            for run in self.get_task_run_tree(root_run_id):
+                local_session_id = run.get("local_session_id")
+                if local_session_id and session_db.get_session(local_session_id) is None:
+                    warnings.append({
+                        "type": "missing_session_link",
+                        "run_id": run.get("run_id"),
+                        "local_session_id": local_session_id,
+                        "message": "No matching local session row was found for this run.",
+                    })
+        return warnings
 
 
 class SessionDB:

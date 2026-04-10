@@ -44,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_state import AccountingDB
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -108,6 +109,16 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, env_var_enabled
 
+
+
+def _infer_accounting_home_id() -> str:
+    hermes_home = get_hermes_home().resolve()
+    parts = hermes_home.parts
+    if "profiles" in parts:
+        idx = parts.index("profiles")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return "default"
 
 
 class _SafeWriter:
@@ -506,7 +517,14 @@ class AIAgent:
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        accounting_db=None,
+        run_id: str = None,
         parent_session_id: str = None,
+        parent_run_id: str = None,
+        root_run_id: str = None,
+        home_id: str = None,
+        launch_kind: str = None,
+        transport_kind: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -774,7 +792,7 @@ class AIAgent:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
-                if self.provider == "copilot-acp":
+                if self.acp_command:
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
                 effective_base = base_url
@@ -992,6 +1010,32 @@ class AIAgent:
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
+
+        self._accounting_db = accounting_db or AccountingDB()
+        self.run_id = run_id or uuid.uuid4().hex
+        self.parent_run_id = parent_run_id
+        self.root_run_id = root_run_id or self.run_id
+        self.home_id = home_id or _infer_accounting_home_id()
+        self.profile_name = None if self.home_id == "default" else self.home_id
+        self.launch_kind = launch_kind or ("root" if self.parent_run_id is None else "delegate_task")
+        self.transport_kind = transport_kind or ("acp" if (self.acp_command or command) else "direct")
+        try:
+            self._accounting_db.create_agent_run(
+                run_id=self.run_id,
+                parent_run_id=self.parent_run_id,
+                root_run_id=self.root_run_id,
+                local_session_id=self.session_id,
+                home_id=self.home_id,
+                profile_name=self.profile_name,
+                launch_kind=self.launch_kind,
+                transport_kind=self.transport_kind,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model_hint=self.model,
+                provider_hint=self.provider,
+                base_url_hint=self.base_url,
+            )
+        except Exception:
+            logger.debug("Could not create accounting run", exc_info=True)
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -3641,7 +3685,7 @@ class AIAgent:
         return False
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+        if self.acp_command or str(client_kwargs.get("base_url", "")).startswith("acp://"):
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(**client_kwargs)
@@ -8039,6 +8083,29 @@ class AIAgent:
                                 )
                             except Exception:
                                 pass  # never block the agent loop
+
+                        try:
+                            self._accounting_db.append_usage_event(
+                                run_id=self.run_id,
+                                root_run_id=self.root_run_id,
+                                home_id=self.home_id,
+                                profile_name=self.profile_name,
+                                local_session_id=self.session_id,
+                                provider=self.provider,
+                                base_url=self.base_url,
+                                model=self.model,
+                                api_mode=self.api_mode,
+                                input_tokens=canonical_usage.input_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                                cache_read_tokens=canonical_usage.cache_read_tokens,
+                                cache_write_tokens=canonical_usage.cache_write_tokens,
+                                reasoning_tokens=canonical_usage.reasoning_tokens,
+                                estimated_cost_usd=float(cost_result.amount_usd)
+                                if cost_result.amount_usd is not None else None,
+                                usage_status="exact",
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
                         
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
@@ -8058,6 +8125,28 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                    elif self.transport_kind == "acp":
+                        try:
+                            self._accounting_db.append_usage_event(
+                                run_id=self.run_id,
+                                root_run_id=self.root_run_id,
+                                home_id=self.home_id,
+                                profile_name=self.profile_name,
+                                local_session_id=self.session_id,
+                                provider=self.provider,
+                                base_url=self.base_url,
+                                model=self.model,
+                                api_mode=self.api_mode,
+                                input_tokens=0,
+                                output_tokens=0,
+                                cache_read_tokens=0,
+                                cache_write_tokens=0,
+                                reasoning_tokens=0,
+                                estimated_cost_usd=None,
+                                usage_status="unknown",
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")

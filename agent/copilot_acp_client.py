@@ -320,12 +320,7 @@ class CopilotACPClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = None
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,

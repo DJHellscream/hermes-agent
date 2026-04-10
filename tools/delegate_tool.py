@@ -21,8 +21,11 @@ import logging
 logger = logging.getLogger(__name__)
 import os
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
+
+import yaml
 
 
 # Tools that children must never have access to
@@ -193,6 +196,45 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     return _callback
 
 
+def _extract_worker_profile_from_acp(acp_command: Optional[str], acp_args: Optional[List[str]]) -> Optional[str]:
+    if not acp_command or not acp_args:
+        return None
+    cmd_name = Path(str(acp_command)).name
+    if not cmd_name.startswith("hermes"):
+        return None
+    args = list(acp_args or [])
+    for i, arg in enumerate(args[:-1]):
+        if arg in {"--profile", "-p"}:
+            profile = str(args[i + 1]).strip()
+            return profile or None
+    return None
+
+
+def _load_profile_runtime(profile_name: str) -> dict:
+    try:
+        from hermes_cli.profiles import get_profile_dir
+    except Exception:
+        return {}
+    try:
+        config_path = get_profile_dir(profile_name) / "config.yaml"
+        if not config_path.exists():
+            return {}
+        data = yaml.safe_load(config_path.read_text()) or {}
+        model_cfg = data.get("model") or {}
+        return {
+            "profile_name": profile_name,
+            "home_id": profile_name,
+            "model": str(model_cfg.get("default") or "").strip() or None,
+            "provider": str(model_cfg.get("provider") or "").strip() or None,
+            "base_url": str(model_cfg.get("base_url") or "").strip() or None,
+            "api_key": str(model_cfg.get("api_key") or "").strip() or None,
+            "api_mode": str(model_cfg.get("api_mode") or "").strip() or None,
+        }
+    except Exception:
+        logger.debug("Could not load profile runtime for ACP worker", exc_info=True)
+        return {}
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -201,7 +243,7 @@ def _build_child_agent(
     model: Optional[str],
     max_iterations: int,
     parent_agent,
-    # Credential overrides from delegation config (provider:model resolution)
+    *,
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
@@ -284,6 +326,19 @@ def _build_child_agent(
     effective_acp_command = override_acp_command or getattr(parent_agent, "acp_command", None)
     effective_acp_args = list(override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or []))
 
+    child_home_id = getattr(parent_agent, 'home_id', None)
+    child_profile_name = getattr(parent_agent, 'profile_name', None)
+    worker_profile = _extract_worker_profile_from_acp(effective_acp_command, effective_acp_args)
+    if worker_profile:
+        profile_runtime = _load_profile_runtime(worker_profile)
+        effective_model = model or profile_runtime.get("model") or effective_model
+        effective_provider = override_provider or profile_runtime.get("provider") or effective_provider
+        effective_base_url = override_base_url or profile_runtime.get("base_url") or effective_base_url
+        effective_api_key = override_api_key or profile_runtime.get("api_key") or effective_api_key
+        effective_api_mode = override_api_mode or profile_runtime.get("api_mode") or effective_api_mode
+        child_home_id = profile_runtime.get("home_id") or worker_profile
+        child_profile_name = profile_runtime.get("profile_name") or worker_profile
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -306,7 +361,13 @@ def _build_child_agent(
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, '_session_db', None),
+        accounting_db=getattr(parent_agent, '_accounting_db', None),
         parent_session_id=getattr(parent_agent, 'session_id', None),
+        parent_run_id=getattr(parent_agent, 'run_id', None),
+        root_run_id=getattr(parent_agent, 'root_run_id', None),
+        home_id=child_home_id,
+        launch_kind="delegate_task",
+        transport_kind="acp" if effective_acp_command else "direct",
         providers_allowed=parent_agent.providers_allowed,
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
