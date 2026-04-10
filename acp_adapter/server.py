@@ -452,6 +452,16 @@ class HermesACPAgent(acp.Agent):
 
         usage = None
         usage_data = result.get("usage")
+        if not usage_data and isinstance(result, dict):
+            usage_data = {
+                "prompt_tokens": result.get("input_tokens", 0),
+                "completion_tokens": result.get("output_tokens", 0),
+                "total_tokens": result.get("total_tokens", 0),
+                "reasoning_tokens": result.get("reasoning_tokens"),
+                "cached_tokens": result.get("cache_read_tokens"),
+            }
+            if not any(v not in (None, 0) for v in usage_data.values()):
+                usage_data = None
         if usage_data and isinstance(usage_data, dict):
             usage = Usage(
                 input_tokens=usage_data.get("prompt_tokens", 0),
