@@ -392,6 +392,38 @@ class TestPrompt:
         assert resp.usage.cached_read_tokens == 7
 
     @pytest.mark.asyncio
+    async def test_prompt_accepts_camel_case_usage_fields(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "Hello!",
+            "messages": [],
+            "usage": {
+                "inputTokens": 123,
+                "outputTokens": 45,
+                "totalTokens": 168,
+                "thoughtTokens": 6,
+                "cachedReadTokens": 7,
+            },
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert isinstance(resp, PromptResponse)
+        assert resp.usage is not None
+        assert resp.usage.input_tokens == 123
+        assert resp.usage.output_tokens == 45
+        assert resp.usage.total_tokens == 168
+        assert resp.usage.thought_tokens == 6
+        assert resp.usage.cached_read_tokens == 7
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")

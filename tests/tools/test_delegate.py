@@ -111,6 +111,13 @@ class TestACPWorkerProfileDetection(unittest.TestCase):
         )
         self.assertEqual(profile, "superbif-stateless")
 
+    def test_extracts_profile_for_hermes_wrapper_name(self):
+        profile = _extract_worker_profile_from_acp(
+            "hermes-custom-wrapper",
+            ["-p", "superbif-stateless", "acp"],
+        )
+        self.assertEqual(profile, "superbif-stateless")
+
     def test_ignores_non_hermes_command_even_with_profile_flag(self):
         profile = _extract_worker_profile_from_acp(
             "python",
