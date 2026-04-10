@@ -463,12 +463,17 @@ class HermesACPAgent(acp.Agent):
             if not any(v not in (None, 0) for v in usage_data.values()):
                 usage_data = None
         if usage_data and isinstance(usage_data, dict):
+            prompt_tokens = usage_data.get("prompt_tokens", usage_data.get("inputTokens", 0))
+            completion_tokens = usage_data.get("completion_tokens", usage_data.get("outputTokens", 0))
+            total_tokens = usage_data.get("total_tokens", usage_data.get("totalTokens", 0))
+            reasoning_tokens = usage_data.get("reasoning_tokens", usage_data.get("thoughtTokens"))
+            cached_tokens = usage_data.get("cached_tokens", usage_data.get("cachedReadTokens"))
             usage = Usage(
-                input_tokens=usage_data.get("prompt_tokens", 0),
-                output_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("total_tokens", 0),
-                thought_tokens=usage_data.get("reasoning_tokens"),
-                cached_read_tokens=usage_data.get("cached_tokens"),
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                thought_tokens=reasoning_tokens,
+                cached_read_tokens=cached_tokens,
             )
 
         stop_reason = "cancelled" if state.cancel_event and state.cancel_event.is_set() else "end_turn"

@@ -25,8 +25,6 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
-import yaml
-
 
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
@@ -210,17 +208,39 @@ def _extract_worker_profile_from_acp(acp_command: Optional[str], acp_args: Optio
     return None
 
 
-def _load_profile_runtime(profile_name: str) -> dict:
+def _resolve_profile_runtime(profile_name: str) -> dict:
     try:
+        import re
+        import yaml
+        from dotenv import dotenv_values
         from hermes_cli.profiles import get_profile_dir
-    except Exception:
-        return {}
-    try:
-        config_path = get_profile_dir(profile_name) / "config.yaml"
+
+        profile_dir = get_profile_dir(profile_name)
+        config_path = profile_dir / "config.yaml"
         if not config_path.exists():
             return {}
-        data = yaml.safe_load(config_path.read_text()) or {}
-        model_cfg = data.get("model") or {}
+
+        env_overlay = dict(os.environ)
+        env_file = profile_dir / ".env"
+        if env_file.exists():
+            env_overlay.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+
+        def _expand_with_env(obj):
+            if isinstance(obj, str):
+                return re.sub(r"\${([^}]+)}", lambda m: env_overlay.get(m.group(1), m.group(0)), obj)
+            if isinstance(obj, dict):
+                return {k: _expand_with_env(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_expand_with_env(v) for v in obj]
+            return obj
+
+        cfg = _expand_with_env(raw_cfg)
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, str):
+            model_cfg = {"default": model_cfg}
         return {
             "profile_name": profile_name,
             "home_id": profile_name,
@@ -231,7 +251,7 @@ def _load_profile_runtime(profile_name: str) -> dict:
             "api_mode": str(model_cfg.get("api_mode") or "").strip() or None,
         }
     except Exception:
-        logger.debug("Could not load profile runtime for ACP worker", exc_info=True)
+        logger.debug("Could not resolve profile runtime for ACP worker", exc_info=True)
         return {}
 
 
@@ -330,7 +350,7 @@ def _build_child_agent(
     child_profile_name = getattr(parent_agent, 'profile_name', None)
     worker_profile = _extract_worker_profile_from_acp(effective_acp_command, effective_acp_args)
     if worker_profile:
-        profile_runtime = _load_profile_runtime(worker_profile)
+        profile_runtime = _resolve_profile_runtime(worker_profile)
         effective_model = model or profile_runtime.get("model") or effective_model
         effective_provider = override_provider or profile_runtime.get("provider") or effective_provider
         effective_base_url = override_base_url or profile_runtime.get("base_url") or effective_base_url
@@ -366,6 +386,7 @@ def _build_child_agent(
         parent_run_id=getattr(parent_agent, 'run_id', None),
         root_run_id=getattr(parent_agent, 'root_run_id', None),
         home_id=child_home_id,
+        profile_name=child_profile_name,
         launch_kind="delegate_task",
         transport_kind="acp" if effective_acp_command else "direct",
         providers_allowed=parent_agent.providers_allowed,
@@ -553,6 +574,14 @@ def _run_single_child(
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
+
+        try:
+            accounting_db = getattr(child, '_accounting_db', None)
+            run_id = getattr(child, 'run_id', None)
+            if accounting_db is not None and run_id:
+                accounting_db.end_agent_run(run_id)
+        except Exception as exc:
+            logger.debug("Could not end child accounting run: %s", exc)
 
         # Remove child from active tracking
 

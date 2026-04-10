@@ -112,13 +112,12 @@ from utils import atomic_json_write, env_var_enabled
 
 
 def _infer_accounting_home_id() -> str:
-    hermes_home = get_hermes_home().resolve()
-    parts = hermes_home.parts
-    if "profiles" in parts:
-        idx = parts.index("profiles")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    return "default"
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = get_active_profile_name() or "default"
+        return "default" if name == "custom" else name
+    except Exception:
+        return "default"
 
 
 class _SafeWriter:
@@ -523,6 +522,7 @@ class AIAgent:
         parent_run_id: str = None,
         root_run_id: str = None,
         home_id: str = None,
+        profile_name: str = None,
         launch_kind: str = None,
         transport_kind: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -1016,7 +1016,8 @@ class AIAgent:
         self.parent_run_id = parent_run_id
         self.root_run_id = root_run_id or self.run_id
         self.home_id = home_id or _infer_accounting_home_id()
-        self.profile_name = None if self.home_id == "default" else self.home_id
+        inferred_profile = None if self.home_id in {"default", "custom"} else self.home_id
+        self.profile_name = profile_name if profile_name is not None else inferred_profile
         self.launch_kind = launch_kind or ("root" if self.parent_run_id is None else "delegate_task")
         self.transport_kind = transport_kind or ("acp" if (self.acp_command or command) else "direct")
         try:
@@ -2662,6 +2663,11 @@ class AIAgent:
         manager. NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        try:
+            self._accounting_db.end_agent_run(self.run_id)
+        except Exception:
+            pass
+
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -6149,8 +6155,27 @@ class AIAgent:
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    system_prompt=new_system_prompt,
                     parent_session_id=old_session_id,
                 )
+                try:
+                    self._accounting_db.create_agent_run(
+                        run_id=self.run_id,
+                        parent_run_id=self.parent_run_id,
+                        root_run_id=self.root_run_id,
+                        local_session_id=self.session_id,
+                        home_id=self.home_id,
+                        profile_name=self.profile_name,
+                        launch_kind=self.launch_kind,
+                        transport_kind=self.transport_kind,
+                        source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        model_hint=self.model,
+                        provider_hint=self.provider,
+                        base_url_hint=self.base_url,
+                    )
+                except Exception:
+                    logger.debug("Could not refresh accounting run after compression", exc_info=True)
+
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
@@ -7118,6 +7143,24 @@ class AIAgent:
         # runtime so this turn gets a fresh attempt with the preferred model.
         # No-op when _fallback_activated is False (gateway, first turn, etc.).
         self._restore_primary_runtime()
+
+        try:
+            self._accounting_db.create_agent_run(
+                run_id=self.run_id,
+                parent_run_id=self.parent_run_id,
+                root_run_id=self.root_run_id,
+                local_session_id=self.session_id,
+                home_id=self.home_id,
+                profile_name=self.profile_name,
+                launch_kind=self.launch_kind,
+                transport_kind=self.transport_kind,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model_hint=self.model,
+                provider_hint=self.provider,
+                base_url_hint=self.base_url,
+            )
+        except Exception:
+            logger.debug("Could not refresh accounting run", exc_info=True)
 
         # Sanitize surrogate characters from user input.  Clipboard paste from
         # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
@@ -9659,7 +9702,7 @@ class AIAgent:
                 session_id=self.session_id,
                 completed=completed,
                 interrupted=interrupted,
-                model=self.model,
+                final_response=final_response,
                 platform=getattr(self, "platform", None) or "",
             )
         except Exception as exc:

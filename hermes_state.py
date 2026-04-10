@@ -268,12 +268,26 @@ class AccountingDB:
 
         def _do(conn):
             conn.execute(
-                """INSERT OR REPLACE INTO agent_runs (
+                """INSERT INTO agent_runs (
                        run_id, parent_run_id, root_run_id, local_session_id,
                        home_id, profile_name, launch_kind, transport_kind,
                        source, model_hint, provider_hint, base_url_hint,
                        started_at, ended_at, metadata_json
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT ended_at FROM agent_runs WHERE run_id = ?), NULL), ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                       parent_run_id = excluded.parent_run_id,
+                       root_run_id = excluded.root_run_id,
+                       local_session_id = excluded.local_session_id,
+                       home_id = excluded.home_id,
+                       profile_name = excluded.profile_name,
+                       launch_kind = excluded.launch_kind,
+                       transport_kind = excluded.transport_kind,
+                       source = excluded.source,
+                       model_hint = excluded.model_hint,
+                       provider_hint = excluded.provider_hint,
+                       base_url_hint = excluded.base_url_hint,
+                       ended_at = NULL,
+                       metadata_json = COALESCE(excluded.metadata_json, agent_runs.metadata_json)""",
                 (
                     run_id,
                     parent_run_id,
@@ -288,7 +302,6 @@ class AccountingDB:
                     provider_hint,
                     base_url_hint,
                     started_at,
-                    run_id,
                     metadata_json,
                 ),
             )
