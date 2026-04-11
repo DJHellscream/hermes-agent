@@ -201,9 +201,12 @@ def _extract_worker_profile_from_acp(acp_command: Optional[str], acp_args: Optio
     if not cmd_name.startswith("hermes"):
         return None
     args = list(acp_args or [])
-    for i, arg in enumerate(args[:-1]):
-        if arg in {"--profile", "-p"}:
+    for i, arg in enumerate(args):
+        if arg in {"--profile", "-p"} and i + 1 < len(args):
             profile = str(args[i + 1]).strip()
+            return profile or None
+        if isinstance(arg, str) and arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1].strip()
             return profile or None
     return None
 
@@ -255,6 +258,29 @@ def _resolve_profile_runtime(profile_name: str) -> dict:
         return {}
 
 
+def _resolve_requested_profile(
+    explicit_profile: Optional[str],
+    acp_command: Optional[str],
+    acp_args: Optional[List[str]],
+) -> Optional[str]:
+    explicit = str(explicit_profile or "").strip() or None
+    implied = _extract_worker_profile_from_acp(acp_command, acp_args)
+    if explicit and implied and explicit != implied:
+        raise ValueError(
+            f"Profile conflict: explicit profile '{explicit}' does not match ACP profile '{implied}'."
+        )
+    selected = explicit or implied
+    if not selected:
+        return None
+
+    from hermes_cli.profiles import profile_exists, validate_profile_name
+
+    validate_profile_name(selected)
+    if not profile_exists(selected):
+        raise ValueError(f"Profile '{selected}' does not exist.")
+    return selected
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -264,6 +290,7 @@ def _build_child_agent(
     max_iterations: int,
     parent_agent,
     *,
+    profile: Optional[str] = None,
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
@@ -343,21 +370,35 @@ def _build_child_agent(
     effective_base_url = override_base_url or parent_agent.base_url
     effective_api_key = override_api_key or parent_api_key
     effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
-    effective_acp_command = override_acp_command or getattr(parent_agent, "acp_command", None)
-    effective_acp_args = list(override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or []))
+    parent_acp_command = getattr(parent_agent, "acp_command", None)
+    if not isinstance(parent_acp_command, str) or not parent_acp_command.strip():
+        parent_acp_command = None
+    parent_acp_args = getattr(parent_agent, "acp_args", [])
+    if not isinstance(parent_acp_args, list):
+        parent_acp_args = list(parent_acp_args) if isinstance(parent_acp_args, tuple) else []
+    effective_acp_command = override_acp_command or parent_acp_command
+    effective_acp_args = list(override_acp_args if override_acp_args is not None else (parent_acp_args or []))
 
     child_home_id = getattr(parent_agent, 'home_id', None)
     child_profile_name = getattr(parent_agent, 'profile_name', None)
-    worker_profile = _extract_worker_profile_from_acp(effective_acp_command, effective_acp_args)
+
+    worker_profile = str(profile or "").strip() or None
+    if worker_profile:
+        effective_acp_command = "hermes"
+        effective_acp_args = ["--profile", worker_profile, "acp"]
+    else:
+        worker_profile = _extract_worker_profile_from_acp(effective_acp_command, effective_acp_args)
+
     if worker_profile:
         profile_runtime = _resolve_profile_runtime(worker_profile)
         effective_model = model or profile_runtime.get("model") or effective_model
-        effective_provider = override_provider or profile_runtime.get("provider") or effective_provider
-        effective_base_url = override_base_url or profile_runtime.get("base_url") or effective_base_url
-        effective_api_key = override_api_key or profile_runtime.get("api_key") or effective_api_key
-        effective_api_mode = override_api_mode or profile_runtime.get("api_mode") or effective_api_mode
         child_home_id = profile_runtime.get("home_id") or worker_profile
         child_profile_name = profile_runtime.get("profile_name") or worker_profile
+
+    if effective_acp_command:
+        effective_provider = "copilot-acp"
+        effective_base_url = "acp://copilot"
+        effective_api_mode = "chat_completions"
 
     child = AIAgent(
         base_url=effective_base_url,
@@ -603,6 +644,7 @@ def delegate_task(
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
+    profile: Optional[str] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     parent_agent=None,
@@ -646,19 +688,45 @@ def delegate_task(
 
     # Normalize to task list
     if tasks and isinstance(tasks, list):
-        task_list = tasks[:MAX_CONCURRENT_CHILDREN]
+        raw_task_list = tasks[:MAX_CONCURRENT_CHILDREN]
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "toolsets": toolsets}]
+        raw_task_list = [{
+            "goal": goal,
+            "context": context,
+            "toolsets": toolsets,
+            "profile": profile,
+            "acp_command": acp_command,
+            "acp_args": acp_args,
+        }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
-    if not task_list:
+    if not raw_task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
-    for i, task in enumerate(task_list):
+    # Validate and normalize each task.
+    task_list = []
+    for i, task in enumerate(raw_task_list):
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        task_acp_command = task.get("acp_command") or acp_command
+        task_acp_args = task.get("acp_args") or acp_args
+        task_profile = task.get("profile") if "profile" in task else profile
+        try:
+            resolved_profile = _resolve_requested_profile(task_profile, task_acp_command, task_acp_args)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if resolved_profile:
+            task_acp_command = "hermes"
+            task_acp_args = ["--profile", resolved_profile, "acp"]
+        task_list.append({
+            "goal": task["goal"],
+            "context": task.get("context"),
+            "toolsets": task.get("toolsets") or toolsets,
+            "profile": resolved_profile,
+            "acp_command": task_acp_command,
+            "acp_args": task_acp_args,
+        })
 
     overall_start = time.monotonic()
     results = []
@@ -681,13 +749,14 @@ def delegate_task(
         for i, t in enumerate(task_list):
             child = _build_child_agent(
                 task_index=i, goal=t["goal"], context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets, model=creds["model"],
+                toolsets=t.get("toolsets"), model=creds["model"],
                 max_iterations=effective_max_iter, parent_agent=parent_agent,
+                profile=t.get("profile"),
                 override_provider=creds["provider"], override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
-                override_acp_command=t.get("acp_command") or acp_command,
-                override_acp_args=t.get("acp_args") or acp_args,
+                override_acp_command=t.get("acp_command"),
+                override_acp_args=t.get("acp_args"),
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -937,7 +1006,7 @@ DELEGATE_TASK_SCHEMA = {
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
         "TWO MODES (one of 'goal' or 'tasks' is required):\n"
-        "1. Single task: provide 'goal' (+ optional context, toolsets)\n"
+        "1. Single task: provide 'goal' (+ optional context, toolsets, profile)\n"
         "2. Batch (parallel): provide 'tasks' array with up to 3 items. "
         "All run concurrently and results are returned together.\n\n"
         "WHEN TO USE delegate_task:\n"
@@ -986,6 +1055,14 @@ DELEGATE_TASK_SCHEMA = {
                     "full-stack tasks."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional named Hermes profile for the delegated child. "
+                    "When set, the child is launched via `hermes --profile <name> acp` "
+                    "so it uses that profile's runtime and home."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -997,6 +1074,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Toolsets for this specific task. Use 'web' for network access, 'terminal' for shell.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Optional named Hermes profile for this task.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -1028,9 +1109,8 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Override ACP command for child agents (e.g. 'claude', 'copilot'). "
-                    "When set, children use ACP subprocess transport instead of inheriting "
-                    "the parent's transport. Enables spawning Claude Code (claude --acp --stdio) "
-                    "or other ACP-capable agents from any parent, including Discord/Telegram/CLI."
+                    "Use `profile` for named Hermes profiles; Hermes ACP launches with `--profile` "
+                    "are normalized to the same profile-backed path."
                 ),
             },
             "acp_args": {
@@ -1060,6 +1140,7 @@ registry.register(
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
         max_iterations=args.get("max_iterations"),
+        profile=args.get("profile"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         parent_agent=kw.get("parent_agent")),

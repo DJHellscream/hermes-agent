@@ -67,8 +67,10 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("profile", props)
         self.assertIn("max_iterations", props)
         self.assertEqual(props["tasks"]["maxItems"], 3)
+        self.assertIn("profile", props["tasks"]["items"]["properties"])
 
 
 class TestChildSystemPrompt(unittest.TestCase):
@@ -183,6 +185,19 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
         result = json.loads(delegate_task(tasks=[{"context": "no goal here"}], parent_agent=parent))
         self.assertIn("error", result)
+
+    def test_conflicting_explicit_profile_and_acp_profile_returns_error(self):
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="Test profile conflict",
+            profile="coder",
+            acp_command="hermes",
+            acp_args=["--profile", "reviewer", "acp"],
+            parent_agent=parent,
+        ))
+        self.assertIn("error", result)
+        self.assertIn("profile", result["error"].lower())
+        self.assertIn("conflict", result["error"].lower())
 
     @patch("tools.delegate_tool._run_single_child")
     def test_single_task_mode(self, mock_run):
@@ -308,6 +323,68 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    @patch("tools.delegate_tool._resolve_profile_runtime")
+    def test_explicit_profile_builds_hermes_acp_child(self, mock_profile_runtime):
+        parent = _make_mock_parent(depth=0)
+        mock_profile_runtime.return_value = {
+            "home_id": "coder",
+            "profile_name": "coder",
+            "model": "google/gemma-3",
+            "provider": "custom",
+            "base_url": "http://coder.example/v1",
+            "api_key": "profile-key",
+            "api_mode": "chat_completions",
+        }
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Use coder profile", profile="coder", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["acp_command"], "hermes")
+            self.assertEqual(kwargs["acp_args"], ["--profile", "coder", "acp"])
+            self.assertEqual(kwargs["provider"], "copilot-acp")
+            self.assertEqual(kwargs["base_url"], "acp://copilot")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["home_id"], "coder")
+            self.assertEqual(kwargs["profile_name"], "coder")
+            self.assertEqual(kwargs["transport_kind"], "acp")
+
+    def test_top_level_generic_acp_command_uses_acp_transport(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Use external ACP",
+                acp_command="copilot",
+                acp_args=["--acp", "--stdio"],
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["acp_command"], "copilot")
+            self.assertEqual(kwargs["acp_args"], ["--acp", "--stdio"])
+            self.assertEqual(kwargs["provider"], "copilot-acp")
+            self.assertEqual(kwargs["base_url"], "acp://copilot")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["transport_kind"], "acp")
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
