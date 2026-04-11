@@ -44,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_state import AccountingDB
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -108,6 +109,15 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, env_var_enabled
 
+
+
+def _infer_accounting_home_id() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = get_active_profile_name() or "default"
+        return name
+    except Exception:
+        return "default"
 
 
 class _SafeWriter:
@@ -591,7 +601,15 @@ class AIAgent:
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        accounting_db=None,
+        run_id: str = None,
         parent_session_id: str = None,
+        parent_run_id: str = None,
+        root_run_id: str = None,
+        home_id: str = None,
+        profile_name: str = None,
+        launch_kind: str = None,
+        transport_kind: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -875,9 +893,9 @@ class AIAgent:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
-                if self.provider == "copilot-acp":
+                if getattr(self, "acp_command", None):
                     client_kwargs["command"] = self.acp_command
-                    client_kwargs["args"] = self.acp_args
+                    client_kwargs["args"] = getattr(self, "acp_args", [])
                 effective_base = base_url
                 if "openrouter" in effective_base.lower():
                     client_kwargs["default_headers"] = {
@@ -908,6 +926,10 @@ class AIAgent:
                     # Preserve any default_headers the router set
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
+                    if hasattr(_routed_client, 'command') and getattr(_routed_client, 'command'):
+                        client_kwargs["command"] = getattr(_routed_client, 'command')
+                    if hasattr(_routed_client, 'args') and getattr(_routed_client, 'args', None):
+                        client_kwargs["args"] = list(getattr(_routed_client, 'args') or [])
                 else:
                     # When the user explicitly chose a non-OpenRouter provider
                     # but no credentials were found, fail fast with a clear
@@ -929,6 +951,9 @@ class AIAgent:
                             "X-OpenRouter-Categories": "productivity,cli-agent",
                         },
                     }
+            if getattr(self, "acp_command", None):
+                client_kwargs["command"] = self.acp_command
+                client_kwargs["args"] = getattr(self, "acp_args", [])
             
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
@@ -1094,6 +1119,34 @@ class AIAgent:
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
+
+        self._accounting_db = accounting_db or AccountingDB()
+        self.run_id = run_id or uuid.uuid4().hex
+        self.parent_run_id = parent_run_id
+        self.root_run_id = root_run_id or self.run_id
+        self.home_id = home_id or _infer_accounting_home_id()
+        inferred_profile = None if self.home_id in {"default", "custom"} else self.home_id
+        self.profile_name = profile_name if profile_name is not None else inferred_profile
+        self.launch_kind = launch_kind or ("root" if self.parent_run_id is None else "delegate_task")
+        self.transport_kind = transport_kind or ("acp" if (self.acp_command or command) else "direct")
+        self._has_started_root_task_run = False
+        try:
+            self._accounting_db.create_agent_run(
+                run_id=self.run_id,
+                parent_run_id=self.parent_run_id,
+                root_run_id=self.root_run_id,
+                local_session_id=self.session_id,
+                home_id=self.home_id,
+                profile_name=self.profile_name,
+                launch_kind=self.launch_kind,
+                transport_kind=self.transport_kind,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model_hint=self.model,
+                provider_hint=self.provider,
+                base_url_hint=self.base_url,
+            )
+        except Exception:
+            logger.debug("Could not create accounting run", exc_info=True)
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -1372,6 +1425,7 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._current_assistant_telemetry = None
         
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -2253,6 +2307,19 @@ class AIAgent:
                     reasoning=msg.get("reasoning") if role == "assistant" else None,
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    run_id=msg.get("run_id") if role == "assistant" else None,
+                    root_run_id=msg.get("root_run_id") if role == "assistant" else None,
+                    provider=msg.get("provider") if role == "assistant" else None,
+                    base_url=msg.get("base_url") if role == "assistant" else None,
+                    model=msg.get("model") if role == "assistant" else None,
+                    api_mode=msg.get("api_mode") if role == "assistant" else None,
+                    input_tokens=msg.get("input_tokens", 0) if role == "assistant" else 0,
+                    output_tokens=msg.get("output_tokens", 0) if role == "assistant" else 0,
+                    cache_read_tokens=msg.get("cache_read_tokens", 0) if role == "assistant" else 0,
+                    cache_write_tokens=msg.get("cache_write_tokens", 0) if role == "assistant" else 0,
+                    reasoning_tokens=msg.get("reasoning_tokens", 0) if role == "assistant" else 0,
+                    estimated_cost_usd=msg.get("estimated_cost_usd") if role == "assistant" else None,
+                    usage_status=msg.get("usage_status") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -2905,6 +2972,11 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        try:
+            self._accounting_db.end_agent_run(self.run_id)
+        except Exception:
+            pass
+
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -3276,7 +3348,7 @@ class AIAgent:
     def _cap_delegate_task_calls(tool_calls: list) -> list:
         """Truncate excess delegate_task calls to max_concurrent_children.
 
-        The delegate_tool caps the task list inside a single call, but the
+        The delegate tool caps the task list inside a single call, but the
         model can emit multiple separate delegate_task tool_calls in one
         turn.  This truncates the excess, preserving all non-delegate calls.
 
@@ -3299,7 +3371,8 @@ class AIAgent:
         logger.warning(
             "Truncated %d excess delegate_task call(s) to enforce "
             "max_concurrent_children=%d limit",
-            delegate_count - max_children, max_children,
+            delegate_count - max_children,
+            max_children,
         )
         return truncated
 
@@ -3999,7 +4072,7 @@ class AIAgent:
         return False
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+        if getattr(self, "acp_command", None) or str(client_kwargs.get("base_url", "")).startswith("acp://"):
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(**client_kwargs)
@@ -6217,6 +6290,9 @@ class AIAgent:
             "reasoning": reasoning_text,
             "finish_reason": finish_reason,
         }
+        telemetry = getattr(self, "_current_assistant_telemetry", None)
+        if telemetry:
+            msg.update(telemetry)
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
@@ -6539,8 +6615,27 @@ class AIAgent:
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    system_prompt=new_system_prompt,
                     parent_session_id=old_session_id,
                 )
+                try:
+                    self._accounting_db.create_agent_run(
+                        run_id=self.run_id,
+                        parent_run_id=self.parent_run_id,
+                        root_run_id=self.root_run_id,
+                        local_session_id=self.session_id,
+                        home_id=self.home_id,
+                        profile_name=self.profile_name,
+                        launch_kind=self.launch_kind,
+                        transport_kind=self.transport_kind,
+                        source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                        model_hint=self.model,
+                        provider_hint=self.provider,
+                        base_url_hint=self.base_url,
+                    )
+                except Exception:
+                    logger.debug("Could not refresh accounting run after compression", exc_info=True)
+
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
@@ -7495,6 +7590,27 @@ class AIAgent:
 
         return final_response
 
+    def _begin_new_root_task_run_if_needed(self) -> None:
+        """Rotate to a fresh root run for each new top-level turn.
+
+        Long-lived CLI sessions reuse one AIAgent instance across many user
+        turns. Accounting should track each top-level task tree separately,
+        while delegated children within a turn still inherit that root. The
+        first turn uses the run created at init; later turns end the prior run
+        and mint a fresh root run id.
+        """
+        if self.parent_run_id is not None or self.launch_kind != "root":
+            return
+        if not self._has_started_root_task_run:
+            self._has_started_root_task_run = True
+            return
+        try:
+            self._accounting_db.end_agent_run(self.run_id)
+        except Exception:
+            logger.debug("Could not end previous root accounting run", exc_info=True)
+        self.run_id = uuid.uuid4().hex
+        self.root_run_id = self.run_id
+
     def run_conversation(
         self,
         user_message: str,
@@ -7531,6 +7647,25 @@ class AIAgent:
         # runtime so this turn gets a fresh attempt with the preferred model.
         # No-op when _fallback_activated is False (gateway, first turn, etc.).
         self._restore_primary_runtime()
+        self._begin_new_root_task_run_if_needed()
+
+        try:
+            self._accounting_db.create_agent_run(
+                run_id=self.run_id,
+                parent_run_id=self.parent_run_id,
+                root_run_id=self.root_run_id,
+                local_session_id=self.session_id,
+                home_id=self.home_id,
+                profile_name=self.profile_name,
+                launch_kind=self.launch_kind,
+                transport_kind=self.transport_kind,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model_hint=self.model,
+                provider_hint=self.provider,
+                base_url_hint=self.base_url,
+            )
+        except Exception:
+            logger.debug("Could not refresh accounting run", exc_info=True)
 
         # Sanitize surrogate characters from user input.  Clipboard paste from
         # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
@@ -8416,6 +8551,7 @@ class AIAgent:
                             }
                     
                     # Track actual token usage from response for context management
+                    self._current_assistant_telemetry = None
                     if hasattr(response, 'usage') and response.usage:
                         canonical_usage = normalize_usage(
                             response.usage,
@@ -8475,6 +8611,22 @@ class AIAgent:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+                        self._current_assistant_telemetry = {
+                            "run_id": self.run_id,
+                            "root_run_id": self.root_run_id,
+                            "provider": self.provider,
+                            "base_url": self.base_url,
+                            "model": self.model,
+                            "api_mode": self.api_mode,
+                            "input_tokens": canonical_usage.input_tokens,
+                            "output_tokens": canonical_usage.output_tokens,
+                            "cache_read_tokens": canonical_usage.cache_read_tokens,
+                            "cache_write_tokens": canonical_usage.cache_write_tokens,
+                            "reasoning_tokens": canonical_usage.reasoning_tokens,
+                            "estimated_cost_usd": float(cost_result.amount_usd)
+                            if cost_result.amount_usd is not None else None,
+                            "usage_status": "exact",
+                        }
 
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI
@@ -8504,6 +8656,29 @@ class AIAgent:
                                 )
                             except Exception:
                                 pass  # never block the agent loop
+
+                        try:
+                            self._accounting_db.append_usage_event(
+                                run_id=self.run_id,
+                                root_run_id=self.root_run_id,
+                                home_id=self.home_id,
+                                profile_name=self.profile_name,
+                                local_session_id=self.session_id,
+                                provider=self.provider,
+                                base_url=self.base_url,
+                                model=self.model,
+                                api_mode=self.api_mode,
+                                input_tokens=canonical_usage.input_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                                cache_read_tokens=canonical_usage.cache_read_tokens,
+                                cache_write_tokens=canonical_usage.cache_write_tokens,
+                                reasoning_tokens=canonical_usage.reasoning_tokens,
+                                estimated_cost_usd=float(cost_result.amount_usd)
+                                if cost_result.amount_usd is not None else None,
+                                usage_status="exact",
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
                         
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
@@ -8523,6 +8698,43 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                    else:
+                        self._current_assistant_telemetry = {
+                            "run_id": self.run_id,
+                            "root_run_id": self.root_run_id,
+                            "provider": self.provider,
+                            "base_url": self.base_url,
+                            "model": self.model,
+                            "api_mode": self.api_mode,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "estimated_cost_usd": None,
+                            "usage_status": "unknown",
+                        }
+                        try:
+                            self._accounting_db.append_usage_event(
+                                run_id=self.run_id,
+                                root_run_id=self.root_run_id,
+                                home_id=self.home_id,
+                                profile_name=self.profile_name,
+                                local_session_id=self.session_id,
+                                provider=self.provider,
+                                base_url=self.base_url,
+                                model=self.model,
+                                api_mode=self.api_mode,
+                                input_tokens=0,
+                                output_tokens=0,
+                                cache_read_tokens=0,
+                                cache_write_tokens=0,
+                                reasoning_tokens=0,
+                                estimated_cost_usd=None,
+                                usage_status="unknown",
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")
@@ -10143,7 +10355,7 @@ class AIAgent:
                 session_id=self.session_id,
                 completed=completed,
                 interrupted=interrupted,
-                model=self.model,
+                final_response=final_response,
                 platform=getattr(self, "platform", None) or "",
             )
         except Exception as exc:

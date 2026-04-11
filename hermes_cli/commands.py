@@ -143,6 +143,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
+    CommandDef("accounting", "Show task-tree accounting for the current or specified root run", "Info",
+               cli_only=True, args_hint="[current|root_run_id]"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",

@@ -5063,6 +5063,8 @@ class HermesCLI:
             self._manual_compress()
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "accounting":
+            self._show_accounting(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "paste":
@@ -6047,6 +6049,241 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _resolve_accounting_root_run_id(self, target: str, accounting_db) -> str | None:
+        target = (target or "current").strip()
+        if target and target.lower() != "current":
+            return target
+
+        agent = getattr(self, "agent", None)
+        root_run_id = getattr(agent, "root_run_id", None)
+        if root_run_id:
+            return root_run_id
+
+        run_id = getattr(agent, "run_id", None)
+        if run_id:
+            run = accounting_db.get_agent_run(run_id)
+            if run and run.get("root_run_id"):
+                return run["root_run_id"]
+
+        session_id = getattr(self, "session_id", None)
+        if session_id:
+            return accounting_db.get_latest_root_run_id_for_session(session_id)
+        return None
+
+    @staticmethod
+    def _accounting_total_tokens(row: dict) -> int:
+        return (
+            int(row.get("input_tokens") or 0)
+            + int(row.get("output_tokens") or 0)
+            + int(row.get("cache_read_tokens") or 0)
+            + int(row.get("cache_write_tokens") or 0)
+            + int(row.get("reasoning_tokens") or 0)
+        )
+
+    @staticmethod
+    def _format_accounting_usage_summary(row: dict) -> str:
+        parts = [
+            f"in {int(row.get('input_tokens') or 0):,}",
+            f"out {int(row.get('output_tokens') or 0):,}",
+        ]
+        if int(row.get("cache_read_tokens") or 0):
+            parts.append(f"cache-read {int(row.get('cache_read_tokens') or 0):,}")
+        if int(row.get("cache_write_tokens") or 0):
+            parts.append(f"cache-write {int(row.get('cache_write_tokens') or 0):,}")
+        if int(row.get("reasoning_tokens") or 0):
+            parts.append(f"reasoning {int(row.get('reasoning_tokens') or 0):,}")
+        parts.append(f"total {HermesCLI._accounting_total_tokens(row):,}")
+        return "  ".join(parts)
+
+    @staticmethod
+    def _format_accounting_timestamp(timestamp_value) -> str:
+        if timestamp_value is None:
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(float(timestamp_value)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "n/a"
+
+    @staticmethod
+    def _format_accounting_cost(amount) -> str:
+        if amount is None:
+            return "n/a"
+        return f"${float(amount):.5f}"
+
+    @staticmethod
+    def _short_run_id(run_id: str | None) -> str:
+        return (run_id or "unknown")[:8]
+
+    def _show_accounting(self, command: str = "/accounting"):
+        """Show task-tree accounting for the current or specified root run."""
+        from hermes_state import AccountingDB, SessionDB
+
+        parts = command.split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else "current"
+
+        created_accounting_db = False
+        accounting_db = getattr(getattr(self, "agent", None), "_accounting_db", None)
+        if accounting_db is None:
+            accounting_db = AccountingDB()
+            created_accounting_db = True
+
+        session_db = getattr(self, "_session_db", None)
+        created_session_db = False
+        if session_db is None:
+            try:
+                session_db = SessionDB()
+                created_session_db = True
+            except Exception:
+                session_db = None
+
+        try:
+            root_run_id = self._resolve_accounting_root_run_id(target, accounting_db)
+            if not root_run_id:
+                print("(._.) No current task accounting found.")
+                return
+
+            root_run = accounting_db.get_agent_run(root_run_id)
+            if root_run is None:
+                print(f"(._.) Root run not found: {root_run_id}")
+                return
+
+            summary = accounting_db.get_task_usage_summary(root_run_id)
+            breakdown = sorted(
+                accounting_db.get_task_usage_breakdown(root_run_id),
+                key=lambda row: (
+                    self._accounting_total_tokens(row),
+                    float(row.get("estimated_cost_usd") or 0.0),
+                ),
+                reverse=True,
+            )
+            run_tree = accounting_db.get_task_run_tree(root_run_id)
+            session_links = accounting_db.get_task_session_links(root_run_id, session_db=session_db)
+            warnings = list(accounting_db.get_task_provenance_warnings(root_run_id, session_db=session_db))
+            if root_run.get("ended_at") is None:
+                warnings.append({
+                    "type": "run_active",
+                    "message": "Run is still active; totals may still change.",
+                })
+
+            root_link = next((link for link in session_links if link.get("run_id") == root_run_id), None)
+            child_sessions = [
+                link.get("local_session_id")
+                for link in session_links
+                if link.get("run_id") != root_run_id and link.get("local_session_id")
+            ]
+
+            def _print_totals(label: str, row: dict) -> None:
+                print(f"  {label:<14} {self._format_accounting_usage_summary(row)}")
+
+            print("Task accounting")
+            print(f"Root run: {root_run_id}")
+            print(f"Started: {self._format_accounting_timestamp(root_run.get('started_at'))}")
+            print(
+                "Ended: "
+                + (
+                    self._format_accounting_timestamp(root_run.get("ended_at"))
+                    if root_run.get("ended_at") is not None
+                    else "running"
+                )
+            )
+            print(f"Session: {root_run.get('local_session_id') or 'n/a'}")
+            print(f"Home: {root_run.get('home_id') or 'n/a'}")
+            print()
+            print("Totals")
+            _print_totals("Root agent only", summary["manager_only"])
+            _print_totals("Subagents only", summary["worker_only"])
+            _print_totals("Whole task", summary["total"])
+            print()
+            print("Usage status")
+            print(f"  Exact events:    {summary['exact_event_count']}")
+            print(f"  Unknown events:  {summary['unknown_event_count']}")
+            print()
+            print("Estimated cost")
+            print(f"  Total: {self._format_accounting_cost(summary['total'].get('estimated_cost_usd'))}")
+            print()
+            print("Breakdown by model/provider/api_mode")
+            if breakdown:
+                for row in breakdown:
+                    route_parts = [
+                        row.get("provider") or "unknown",
+                        row.get("model") or "unknown",
+                    ]
+                    if row.get("base_url"):
+                        route_parts.append(row["base_url"])
+                    if row.get("api_mode"):
+                        route_parts.append(f"api_mode={row['api_mode']}")
+                    route = " | ".join(route_parts)
+                    print(f"  {route}")
+                    print(
+                        f"    {self._format_accounting_usage_summary(row)}  "
+                        f"events {int(row.get('exact_event_count') or 0) + int(row.get('unknown_event_count') or 0)}  "
+                        f"exact {int(row.get('exact_event_count') or 0)} unknown {int(row.get('unknown_event_count') or 0)}"
+                    )
+                    print()
+            else:
+                print("  none")
+                print()
+
+            print("Run tree")
+            if run_tree:
+                for run in run_tree:
+                    role = "root" if run.get("parent_run_id") is None else "child"
+                    if role == "root":
+                        row = summary["manager_only"]
+                    else:
+                        child_rows = [item for item in breakdown if item.get("run_id") == run.get("run_id")]
+                        row = {
+                            "input_tokens": sum(int(item.get("input_tokens") or 0) for item in child_rows),
+                            "output_tokens": sum(int(item.get("output_tokens") or 0) for item in child_rows),
+                            "cache_read_tokens": sum(int(item.get("cache_read_tokens") or 0) for item in child_rows),
+                            "cache_write_tokens": sum(int(item.get("cache_write_tokens") or 0) for item in child_rows),
+                            "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in child_rows),
+                        }
+                    unknown_count = sum(
+                        int(item.get("unknown_event_count") or 0)
+                        for item in breakdown
+                        if item.get("run_id") == run.get("run_id")
+                    )
+                    status = "exact" if unknown_count == 0 else "mixed"
+                    print(
+                        f"  {role:<8} {self._short_run_id(run.get('run_id'))}  "
+                        f"profile={run.get('profile_name') or run.get('home_id') or 'default'}  "
+                        f"transport={run.get('transport_kind') or 'unknown'}  "
+                        f"launch={run.get('launch_kind') or 'unknown'}  "
+                        f"{self._format_accounting_usage_summary(row)}  {status}"
+                    )
+            else:
+                print("  none")
+            print()
+
+            print("Session links")
+            print(f"  root run session:   {(root_link or {}).get('local_session_id') or 'n/a'}")
+            print(f"  child sessions:     {', '.join(child_sessions) if child_sessions else 'none'}")
+            print()
+
+            print("Warnings")
+            if warnings:
+                for warning in warnings:
+                    message = warning.get('message', 'unknown warning')
+                    if warning.get("type") == "unknown_usage" and int(summary.get("unknown_event_count") or 0):
+                        unknown_count = int(summary.get("unknown_event_count") or 0)
+                        noun = "event" if unknown_count == 1 else "events"
+                        verb = "is" if unknown_count == 1 else "are"
+                        message = (
+                            f"Unknown/non-exact usage present: {unknown_count} {noun} {verb} non-exact; "
+                            "totals and estimated cost are not exact."
+                        )
+                    print(f"  WARNING: {message}")
+            else:
+                print("  none")
+        except Exception as e:
+            print(f"  Error generating accounting report: {e}")
+        finally:
+            if created_session_db and session_db is not None:
+                session_db.close()
+            if created_accounting_db and accounting_db is not None:
+                accounting_db.close()
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

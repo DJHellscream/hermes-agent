@@ -29,6 +29,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _extract_worker_profile_from_acp,
+    _resolve_profile_runtime,
 )
 
 
@@ -100,6 +102,60 @@ class TestStripBlockedTools(unittest.TestCase):
     def test_empty_input(self):
         result = _strip_blocked_tools([])
         self.assertEqual(result, [])
+
+
+class TestACPWorkerProfileDetection(unittest.TestCase):
+    def test_extracts_profile_for_hermes_acp_command(self):
+        profile = _extract_worker_profile_from_acp(
+            "/usr/local/bin/hermes",
+            ["--profile", "superbif-stateless", "acp"],
+        )
+        self.assertEqual(profile, "superbif-stateless")
+
+    def test_extracts_profile_for_hermes_wrapper_name(self):
+        profile = _extract_worker_profile_from_acp(
+            "hermes-custom-wrapper",
+            ["-p", "superbif-stateless", "acp"],
+        )
+        self.assertEqual(profile, "superbif-stateless")
+
+    def test_ignores_non_hermes_command_even_with_profile_flag(self):
+        profile = _extract_worker_profile_from_acp(
+            "python",
+            ["--profile", "not-a-hermes-profile", "something-else"],
+        )
+        self.assertIsNone(profile)
+
+
+class TestACPWorkerProfileRuntime(unittest.TestCase):
+    def test_resolves_profile_runtime_with_env_expansion(self):
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            profile_dir = tmp / '.hermes' / 'profiles' / 'coder'
+            profile_dir.mkdir(parents=True)
+            (profile_dir / '.env').write_text('PROFILE_BASE_URL=http://local.example/v1\n')
+            (profile_dir / 'config.yaml').write_text(
+                'model:\n'
+                '  default: test-model\n'
+                '  provider: custom\n'
+                '  base_url: ${PROFILE_BASE_URL}\n'
+                '  api_key: dummy\n'
+                '  api_mode: chat_completions\n'
+            )
+            with patch('hermes_cli.profiles.get_profile_dir', return_value=profile_dir):
+                resolved = _resolve_profile_runtime('coder')
+
+            self.assertEqual(resolved['home_id'], 'coder')
+            self.assertEqual(resolved['profile_name'], 'coder')
+            self.assertEqual(resolved['model'], 'test-model')
+            self.assertEqual(resolved['provider'], 'custom')
+            self.assertEqual(resolved['base_url'], 'http://local.example/v1')
+            self.assertEqual(resolved['api_key'], 'dummy')
+            self.assertEqual(resolved['api_mode'], 'chat_completions')
 
 
 class TestDelegateTask(unittest.TestCase):

@@ -127,7 +127,14 @@ class SessionManager:
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
         with self._lock:
-            existed = self._sessions.pop(session_id, None) is not None
+            state = self._sessions.pop(session_id, None)
+            existed = state is not None
+        if state is not None:
+            try:
+                if hasattr(state.agent, "shutdown_memory_provider"):
+                    state.agent.shutdown_memory_provider(state.history)
+            except Exception:
+                logger.debug("ACP remove_session cleanup failed", exc_info=True)
         db_existed = self._delete_persisted(session_id)
         if existed or db_existed:
             _clear_task_cwd(session_id)

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -221,6 +222,67 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     return _callback
 
 
+def _extract_worker_profile_from_acp(acp_command: Optional[str], acp_args: Optional[List[str]]) -> Optional[str]:
+    if not acp_command or not acp_args:
+        return None
+    cmd_name = Path(str(acp_command)).name
+    if not cmd_name.startswith("hermes"):
+        return None
+    args = list(acp_args or [])
+    for i, arg in enumerate(args[:-1]):
+        if arg in {"--profile", "-p"}:
+            profile = str(args[i + 1]).strip()
+            return profile or None
+    return None
+
+
+def _resolve_profile_runtime(profile_name: str) -> dict:
+    try:
+        import re
+        import yaml
+        from dotenv import dotenv_values
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_dir = get_profile_dir(profile_name)
+        config_path = profile_dir / "config.yaml"
+        if not config_path.exists():
+            return {}
+
+        env_overlay = dict(os.environ)
+        env_file = profile_dir / ".env"
+        if env_file.exists():
+            env_overlay.update({k: v for k, v in dotenv_values(env_file).items() if v is not None})
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+
+        def _expand_with_env(obj):
+            if isinstance(obj, str):
+                return re.sub(r"\${([^}]+)}", lambda m: env_overlay.get(m.group(1), m.group(0)), obj)
+            if isinstance(obj, dict):
+                return {k: _expand_with_env(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_expand_with_env(v) for v in obj]
+            return obj
+
+        cfg = _expand_with_env(raw_cfg)
+        model_cfg = cfg.get("model") or {}
+        if isinstance(model_cfg, str):
+            model_cfg = {"default": model_cfg}
+        return {
+            "profile_name": profile_name,
+            "home_id": profile_name,
+            "model": str(model_cfg.get("default") or "").strip() or None,
+            "provider": str(model_cfg.get("provider") or "").strip() or None,
+            "base_url": str(model_cfg.get("base_url") or "").strip() or None,
+            "api_key": str(model_cfg.get("api_key") or "").strip() or None,
+            "api_mode": str(model_cfg.get("api_mode") or "").strip() or None,
+        }
+    except Exception:
+        logger.debug("Could not resolve profile runtime for ACP worker", exc_info=True)
+        return {}
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -229,7 +291,7 @@ def _build_child_agent(
     model: Optional[str],
     max_iterations: int,
     parent_agent,
-    # Credential overrides from delegation config (provider:model resolution)
+    *,
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
@@ -312,6 +374,19 @@ def _build_child_agent(
     effective_acp_command = override_acp_command or getattr(parent_agent, "acp_command", None)
     effective_acp_args = list(override_acp_args if override_acp_args is not None else (getattr(parent_agent, "acp_args", []) or []))
 
+    child_home_id = getattr(parent_agent, "home_id", None)
+    child_profile_name = getattr(parent_agent, "profile_name", None)
+    worker_profile = _extract_worker_profile_from_acp(effective_acp_command, effective_acp_args)
+    if worker_profile:
+        profile_runtime = _resolve_profile_runtime(worker_profile)
+        effective_model = model or profile_runtime.get("model") or effective_model
+        effective_provider = override_provider or profile_runtime.get("provider") or effective_provider
+        effective_base_url = override_base_url or profile_runtime.get("base_url") or effective_base_url
+        effective_api_key = override_api_key or profile_runtime.get("api_key") or effective_api_key
+        effective_api_mode = override_api_mode or profile_runtime.get("api_mode") or effective_api_mode
+        child_home_id = profile_runtime.get("home_id") or worker_profile
+        child_profile_name = profile_runtime.get("profile_name") or worker_profile
+
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
@@ -320,6 +395,7 @@ def _build_child_agent(
         delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
         if delegation_effort:
             from hermes_constants import parse_reasoning_effort
+
             parsed = parse_reasoning_effort(delegation_effort)
             if parsed is not None:
                 child_reasoning = parsed
@@ -353,7 +429,14 @@ def _build_child_agent(
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, '_session_db', None),
+        accounting_db=getattr(parent_agent, '_accounting_db', None),
         parent_session_id=getattr(parent_agent, 'session_id', None),
+        parent_run_id=getattr(parent_agent, 'run_id', None),
+        root_run_id=getattr(parent_agent, 'root_run_id', None),
+        home_id=child_home_id,
+        profile_name=child_profile_name,
+        launch_kind="delegate_task",
+        transport_kind="acp" if effective_acp_command else "direct",
         providers_allowed=parent_agent.providers_allowed,
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
@@ -582,6 +665,14 @@ def _run_single_child(
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
+
+        try:
+            accounting_db = getattr(child, '_accounting_db', None)
+            run_id = getattr(child, 'run_id', None)
+            if accounting_db is not None and run_id:
+                accounting_db.end_agent_run(run_id)
+        except Exception as exc:
+            logger.debug("Could not end child accounting run: %s", exc)
 
         # Remove child from active tracking
 
