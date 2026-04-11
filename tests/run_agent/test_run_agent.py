@@ -1477,6 +1477,60 @@ class TestConcurrentToolExecution:
             mock_todo.assert_called_once()
         assert "ok" in result
 
+    def test_invoke_tool_forwards_delegate_profile_and_acp_args(self, agent):
+        with patch("tools.delegate_tool.delegate_task", return_value='{"ok":true}') as mock_delegate:
+            result = agent._invoke_tool(
+                "delegate_task",
+                {
+                    "goal": "Use coder profile",
+                    "profile": "coder",
+                    "acp_command": "hermes",
+                    "acp_args": ["--profile", "coder", "acp"],
+                },
+                "task-1",
+            )
+
+        mock_delegate.assert_called_once_with(
+            goal="Use coder profile",
+            context=None,
+            toolsets=None,
+            tasks=None,
+            max_iterations=None,
+            profile="coder",
+            acp_command="hermes",
+            acp_args=["--profile", "coder", "acp"],
+            parent_agent=agent,
+        )
+        assert "ok" in result
+
+    def test_sequential_delegate_task_forwards_profile_and_acp_args(self, agent):
+        tool_call = _mock_tool_call(
+            name="delegate_task",
+            arguments='{"goal":"Use coder profile","profile":"coder","acp_command":"hermes","acp_args":["--profile","coder","acp"]}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch("tools.delegate_tool.delegate_task", return_value='{"ok":true}') as mock_delegate:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        mock_delegate.assert_called_once_with(
+            goal="Use coder profile",
+            context=None,
+            toolsets=None,
+            tasks=None,
+            max_iterations=None,
+            profile="coder",
+            acp_command="hermes",
+            acp_args=["--profile", "coder", "acp"],
+            parent_agent=agent,
+        )
+        assert len(messages) == 1
+        assert messages[0]["role"] == "tool"
+        assert messages[0]["tool_call_id"] == "c1"
+        assert "ok" in messages[0]["content"]
+
 
 class TestPathsOverlap:
     """Unit tests for the _paths_overlap helper."""
