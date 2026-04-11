@@ -397,7 +397,7 @@ class TestCLIAccountingReport:
             assert "Root agent only" in output
             assert "Subagents only" in output
             assert "Whole task" in output
-            assert "Breakdown by model/provider" in output
+            assert "Breakdown by model/provider/api_mode" in output
             assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
             assert "custom | google/gemma-4-26B-A4B-it | http://superbif:8000/v1" in output
             assert "cache-write 3" in output
@@ -410,6 +410,54 @@ class TestCLIAccountingReport:
             assert "launch=delegate_task" in output
             assert "Session links" in output
             assert "WARNING: Run is still active; totals may still change." in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_breakdown_labels_include_api_mode(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=1_700_000_000.0,
+            )
+            for api_mode, input_tokens, output_tokens in (
+                ("responses", 100, 10),
+                ("chat_completions", 40, 4),
+            ):
+                accounting_db.append_usage_event(
+                    run_id="root-run",
+                    root_run_id="root-run",
+                    local_session_id="session-root",
+                    home_id="default",
+                    provider="openai",
+                    base_url="https://api.openai.com/v1",
+                    model="gpt-5.4",
+                    api_mode=api_mode,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            cli_obj.agent = SimpleNamespace(root_run_id="root-run", run_id="root-run", _accounting_db=accounting_db)
+
+            cli_obj._show_accounting()
+            output = capsys.readouterr().out
+
+            assert "Breakdown by model/provider/api_mode" in output
+            assert "openai | gpt-5.4 | https://api.openai.com/v1 | api_mode=responses" in output
+            assert "openai | gpt-5.4 | https://api.openai.com/v1 | api_mode=chat_completions" in output
         finally:
             session_db.close()
             accounting_db.close()
@@ -461,6 +509,63 @@ class TestCLIAccountingReport:
 
             assert "Root run: newer-root" in output
             assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_warns_when_usage_is_non_exact(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=1_700_000_000.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=100,
+                output_tokens=10,
+                estimated_cost_usd=0.001,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=25,
+                output_tokens=5,
+                estimated_cost_usd=0.0002,
+                usage_status="unknown",
+            )
+
+            cli_obj._session_db = session_db
+            cli_obj.agent = SimpleNamespace(root_run_id="root-run", run_id="root-run", _accounting_db=accounting_db)
+
+            cli_obj._show_accounting()
+            output = capsys.readouterr().out
+
+            assert "Unknown events:  1" in output
+            assert "WARNING: Unknown/non-exact usage present" in output
+            assert "totals and estimated cost are not exact" in output
         finally:
             session_db.close()
             accounting_db.close()

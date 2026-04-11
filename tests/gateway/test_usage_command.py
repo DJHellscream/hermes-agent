@@ -70,8 +70,63 @@ class TestHandleUsageCommand:
         assert "Cache write: 1" in result
         assert "Reasoning: 7" in result
         assert "Total: 126" in result
+        assert "Estimated cost: $0.0123" in result
+        assert "Telemetry: exact message totals" in result
         assert "Exact messages: 1" in result
         assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in result
+
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_inactive_session_labels_mixed_message_session_telemetry(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "telegram")
+        db.append_message("test_session_123", role="user", content="hello")
+        db.append_message(
+            "test_session_123",
+            role="assistant",
+            content="hi",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.4",
+            api_mode="responses",
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_tokens=5,
+            cache_write_tokens=1,
+            reasoning_tokens=3,
+            estimated_cost_usd=0.0123,
+            usage_status="exact",
+        )
+        db.set_token_counts(
+            "test_session_123",
+            input_tokens=150,
+            output_tokens=25,
+            cache_read_tokens=10,
+            cache_write_tokens=2,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.02,
+            billing_provider="openai-codex",
+            billing_base_url="https://chatgpt.com/backend-api/codex",
+            billing_mode="responses",
+            model="gpt-5.4",
+        )
+
+        runner = _make_runner(db)
+        result = await runner._handle_usage_command(_make_event())
+
+        assert "Session Usage" in result
+        assert "Input: 150" in result
+        assert "Output: 25" in result
+        assert "Cache read: 10" in result
+        assert "Cache write: 2" in result
+        assert "Reasoning: 7" in result
+        assert "Total: 187" in result
+        assert "Estimated cost: $0.02" in result
+        assert "Telemetry: mixed message/session totals" in result
+        assert "Exact messages: 1" in result
 
         db.close()
 
@@ -105,6 +160,7 @@ class TestHandleUsageCommand:
         assert "Cache write: 1" in result
         assert "Reasoning: 2" in result
         assert "Total: 47" in result
+        assert "Estimated cost: $0.0042" in result
         assert "Telemetry: coarse session totals" in result
         assert "openrouter | anthropic/claude-sonnet-4 | https://openrouter.ai/api/v1" in result
 

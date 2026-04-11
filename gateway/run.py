@@ -5330,6 +5330,15 @@ class GatewayRunner:
                         + int(tokens.get("cache_read") or 0)
                         + int(tokens.get("cache_write") or 0)
                     )
+                    estimated_cost = stats.get("estimated_cost_usd")
+
+                    def _format_estimated_cost(amount: float) -> str:
+                        whole, frac = f"{float(amount):.4f}".split(".")
+                        frac = frac.rstrip("0")
+                        if len(frac) < 2:
+                            frac = frac.ljust(2, "0")
+                        return f"${whole}.{frac}"
+
                     lines = [
                         "📊 **Session Usage**",
                         f"Input: {int(tokens.get('input') or 0):,}",
@@ -5339,10 +5348,19 @@ class GatewayRunner:
                         f"Reasoning: {int(tokens.get('reasoning') or 0):,}",
                         f"Total: {total_without_reasoning:,}",
                     ]
-                    if stats.get("telemetry_source") == "sessions":
+                    if estimated_cost is not None:
+                        lines.append(f"Estimated cost: {_format_estimated_cost(estimated_cost)}")
+                    telemetry_source = stats.get("telemetry_source")
+                    telemetry_label = {
+                        "messages": "Telemetry: exact message totals",
+                        "mixed": "Telemetry: mixed message/session totals",
+                        "sessions": "Telemetry: coarse session totals",
+                    }.get(telemetry_source)
+                    if telemetry_label:
+                        lines.append(telemetry_label)
+                    if telemetry_source == "sessions":
                         if int(stats.get("assistant_messages") or 0):
                             lines.append(f"Assistant messages: {int(stats.get('assistant_messages') or 0)}")
-                        lines.append("Telemetry: coarse session totals")
                     else:
                         lines.append(f"Exact messages: {int(stats.get('exact_message_count') or 0)}")
                         if int(stats.get("unknown_message_count") or 0):

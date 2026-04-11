@@ -5875,14 +5875,18 @@ class HermesCLI:
             print("Estimated cost")
             print(f"  Total: {self._format_accounting_cost(summary['total'].get('estimated_cost_usd'))}")
             print()
-            print("Breakdown by model/provider")
+            print("Breakdown by model/provider/api_mode")
             if breakdown:
                 for row in breakdown:
-                    route = " | ".join(
-                        part
-                        for part in [row.get("provider") or "unknown", row.get("model") or "unknown", row.get("base_url") or ""]
-                        if part
-                    )
+                    route_parts = [
+                        row.get("provider") or "unknown",
+                        row.get("model") or "unknown",
+                    ]
+                    if row.get("base_url"):
+                        route_parts.append(row["base_url"])
+                    if row.get("api_mode"):
+                        route_parts.append(f"api_mode={row['api_mode']}")
+                    route = " | ".join(route_parts)
                     print(f"  {route}")
                     print(
                         f"    {self._format_accounting_usage_summary(row)}  "
@@ -5934,7 +5938,16 @@ class HermesCLI:
             print("Warnings")
             if warnings:
                 for warning in warnings:
-                    print(f"  WARNING: {warning.get('message', 'unknown warning')}")
+                    message = warning.get('message', 'unknown warning')
+                    if warning.get("type") == "unknown_usage" and int(summary.get("unknown_event_count") or 0):
+                        unknown_count = int(summary.get("unknown_event_count") or 0)
+                        noun = "event" if unknown_count == 1 else "events"
+                        verb = "is" if unknown_count == 1 else "are"
+                        message = (
+                            f"Unknown/non-exact usage present: {unknown_count} {noun} {verb} non-exact; "
+                            "totals and estimated cost are not exact."
+                        )
+                    print(f"  WARNING: {message}")
             else:
                 print("  none")
         except Exception as e:

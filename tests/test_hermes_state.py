@@ -284,6 +284,40 @@ class TestAccountingLedger:
         assert by_provider["custom"]["unknown_event_count"] == 1
         assert by_provider["custom"]["base_url"] == "http://superbif:8000/v1"
 
+    def test_get_task_usage_breakdown_splits_same_route_by_api_mode(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run",
+            root_run_id="root-run",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+        )
+        for api_mode, input_tokens, output_tokens in (
+            ("responses", 100, 10),
+            ("chat_completions", 40, 4),
+        ):
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                home_id="default",
+                provider="openai",
+                base_url="https://api.openai.com/v1",
+                model="gpt-5.4",
+                api_mode=api_mode,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                usage_status="exact",
+            )
+
+        rows = accounting_db.get_task_usage_breakdown("root-run")
+
+        assert len(rows) == 2
+        by_api_mode = {row["api_mode"]: row for row in rows}
+        assert by_api_mode["responses"]["input_tokens"] == 100
+        assert by_api_mode["responses"]["output_tokens"] == 10
+        assert by_api_mode["chat_completions"]["input_tokens"] == 40
+        assert by_api_mode["chat_completions"]["output_tokens"] == 4
+
     def test_get_task_run_tree_returns_runs_for_root(self, accounting_db):
         accounting_db.create_agent_run(
             run_id="root-run",
