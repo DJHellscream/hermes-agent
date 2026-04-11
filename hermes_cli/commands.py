@@ -129,6 +129,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[page]"),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
+    CommandDef("accounting", "Show task-tree accounting for the current or specified root run", "Info",
+               cli_only=True, args_hint="[current|root_run_id]"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",

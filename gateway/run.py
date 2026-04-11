@@ -5304,8 +5304,64 @@ class GatewayRunner:
 
             return "\n".join(lines)
 
-        # No running agent -- check session history for a rough count
+        # No running agent -- prefer persisted telemetry from state.db.
         session_entry = self.session_store.get_or_create_session(source)
+        if self._session_db:
+            try:
+                stats = self._session_db.get_session_stats(session_entry.session_id)
+            except Exception:
+                stats = None
+            if stats:
+                tokens = stats.get("tokens") or {}
+                breakdown = stats.get("breakdown") or []
+                has_persisted_usage = (
+                    stats.get("telemetry_source") in {"messages", "mixed"}
+                    or int(tokens.get("input") or 0) > 0
+                    or int(tokens.get("output") or 0) > 0
+                    or int(tokens.get("cache_read") or 0) > 0
+                    or int(tokens.get("cache_write") or 0) > 0
+                    or int(tokens.get("reasoning") or 0) > 0
+                    or stats.get("estimated_cost_usd") is not None
+                )
+                if has_persisted_usage:
+                    total_without_reasoning = (
+                        int(tokens.get("input") or 0)
+                        + int(tokens.get("output") or 0)
+                        + int(tokens.get("cache_read") or 0)
+                        + int(tokens.get("cache_write") or 0)
+                    )
+                    lines = [
+                        "📊 **Session Usage**",
+                        f"Input: {int(tokens.get('input') or 0):,}",
+                        f"Output: {int(tokens.get('output') or 0):,}",
+                        f"Cache read: {int(tokens.get('cache_read') or 0):,}",
+                        f"Cache write: {int(tokens.get('cache_write') or 0):,}",
+                        f"Reasoning: {int(tokens.get('reasoning') or 0):,}",
+                        f"Total: {total_without_reasoning:,}",
+                    ]
+                    if stats.get("telemetry_source") == "sessions":
+                        if int(stats.get("assistant_messages") or 0):
+                            lines.append(f"Assistant messages: {int(stats.get('assistant_messages') or 0)}")
+                        lines.append("Telemetry: coarse session totals")
+                    else:
+                        lines.append(f"Exact messages: {int(stats.get('exact_message_count') or 0)}")
+                        if int(stats.get("unknown_message_count") or 0):
+                            lines.append(f"Unknown messages: {int(stats.get('unknown_message_count') or 0)}")
+                    if breakdown:
+                        lines.append("")
+                        lines.append("Breakdown:")
+                        for row in breakdown:
+                            route = " | ".join(
+                                part for part in [
+                                    row.get("provider") or "unknown",
+                                    row.get("model") or "unknown",
+                                    row.get("base_url") or "",
+                                ] if part
+                            )
+                            lines.append(route)
+                    return "\n".join(lines)
+
+        # Final fallback: rough transcript estimate.
         history = self.session_store.load_transcript(session_entry.session_id)
         if history:
             from agent.model_metadata import estimate_messages_tokens_rough

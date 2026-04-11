@@ -17,6 +17,40 @@ def get_hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
 
+def get_default_hermes_root() -> Path:
+    """Return the default pre-profile Hermes root.
+
+    Rules:
+    - If HERMES_HOME is unset, use ``~/.hermes``.
+    - If HERMES_HOME points inside ``~/.hermes`` (including a named profile
+      like ``~/.hermes/profiles/coder``), the default root is still ``~/.hermes``.
+    - If HERMES_HOME points outside ``~/.hermes`` (custom/docker/disposable
+      deployment), treat that custom path as the root.
+    """
+    home = get_hermes_home().expanduser()
+    default_root = Path.home() / ".hermes"
+
+    try:
+        home_resolved = home.resolve(strict=False)
+    except TypeError:
+        home_resolved = home.resolve()
+    try:
+        default_resolved = default_root.resolve(strict=False)
+    except TypeError:
+        default_resolved = default_root.resolve()
+
+    try:
+        home_resolved.relative_to(default_resolved)
+        return default_root
+    except ValueError:
+        pass
+
+    if home_resolved.parent.name == "profiles":
+        return home_resolved.parent.parent
+
+    return home
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 

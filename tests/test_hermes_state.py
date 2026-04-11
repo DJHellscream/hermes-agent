@@ -159,6 +159,29 @@ class TestAccountingLedger:
         assert len(events) == 1
         assert events[0]["run_id"] == "run-a"
 
+    def test_get_latest_root_run_id_for_session_returns_most_recent_root(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=100.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="root-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=200.0,
+        )
+
+        assert accounting_db.get_latest_root_run_id_for_session("session-a") == "root-run-b"
+        assert accounting_db.get_latest_root_run_id_for_session("missing-session") is None
+
     def test_get_task_usage_summary_returns_manager_worker_and_total(self, accounting_db):
         accounting_db.create_agent_run(
             run_id="root-run",
@@ -412,6 +435,156 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["model"] == "anthropic/claude-opus-4.6"
 
+    def test_get_session_stats_prefers_assistant_message_telemetry(self, db):
+        db.create_session(session_id="s1", source="telegram")
+        db.append_message("s1", role="user", content="hello")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="first",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.4",
+            api_mode="responses",
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_tokens=5,
+            cache_write_tokens=1,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.0123,
+            usage_status="exact",
+        )
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="second",
+            provider="custom",
+            base_url="http://superbif:8000/v1",
+            model="google/gemma-4-26B-A4B-it",
+            api_mode="chat_completions",
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+            reasoning_tokens=0,
+            estimated_cost_usd=None,
+            usage_status="unknown",
+        )
+
+        stats = db.get_session_stats("s1")
+        assert stats is not None
+        assert stats["telemetry_source"] == "messages"
+        assert stats["assistant_messages"] == 2
+        assert stats["tokens"]["input"] == 100
+        assert stats["tokens"]["output"] == 20
+        assert stats["tokens"]["cache_read"] == 5
+        assert stats["tokens"]["cache_write"] == 1
+        assert stats["tokens"]["reasoning"] == 7
+        assert stats["tokens"]["total"] == 133
+        assert stats["estimated_cost_usd"] == 0.0123
+        assert stats["exact_message_count"] == 1
+        assert stats["unknown_message_count"] == 1
+        assert len(stats["breakdown"]) == 2
+        assert stats["breakdown"][0]["provider"] == "openai-codex"
+        assert stats["breakdown"][0]["model"] == "gpt-5.4"
+
+    def test_get_session_stats_falls_back_to_session_row_without_message_telemetry(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.set_token_counts(
+            "s1",
+            input_tokens=30,
+            output_tokens=12,
+            cache_read_tokens=4,
+            cache_write_tokens=1,
+            reasoning_tokens=2,
+            estimated_cost_usd=0.0042,
+            billing_provider="openrouter",
+            billing_base_url="https://openrouter.ai/api/v1",
+            billing_mode="chat_completions",
+            model="anthropic/claude-sonnet-4",
+        )
+
+        stats = db.get_session_stats("s1")
+        assert stats is not None
+        assert stats["telemetry_source"] == "sessions"
+        assert stats["tokens"]["input"] == 30
+        assert stats["tokens"]["output"] == 12
+        assert stats["tokens"]["cache_read"] == 4
+        assert stats["tokens"]["cache_write"] == 1
+        assert stats["tokens"]["reasoning"] == 2
+        assert stats["tokens"]["total"] == 49
+        assert stats["estimated_cost_usd"] == 0.0042
+        assert stats["breakdown"] == [
+            {
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "model": "anthropic/claude-sonnet-4",
+                "api_mode": "chat_completions",
+                "input_tokens": 30,
+                "output_tokens": 12,
+                "cache_read_tokens": 4,
+                "cache_write_tokens": 1,
+                "reasoning_tokens": 2,
+                "total_tokens": 49,
+                "estimated_cost_usd": 0.0042,
+                "exact_message_count": 0,
+                "unknown_message_count": 0,
+            }
+        ]
+
+    def test_get_session_stats_merges_legacy_session_totals_with_message_telemetry(self, db):
+        db.create_session(session_id="s1", source="telegram")
+        db.set_token_counts(
+            "s1",
+            input_tokens=130,
+            output_tokens=21,
+            cache_read_tokens=5,
+            cache_write_tokens=1,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.0165,
+            billing_provider="openrouter",
+            billing_base_url="https://openrouter.ai/api/v1",
+            billing_mode="chat_completions",
+            model="anthropic/claude-sonnet-4",
+        )
+        db.append_message("s1", role="assistant", content="legacy assistant")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="new assistant",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.4",
+            api_mode="responses",
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_tokens=5,
+            cache_write_tokens=1,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.0123,
+            usage_status="exact",
+        )
+
+        stats = db.get_session_stats("s1")
+        assert stats is not None
+        assert stats["telemetry_source"] == "mixed"
+        assert stats["assistant_messages"] == 2
+        assert stats["tokens"]["input"] == 130
+        assert stats["tokens"]["output"] == 21
+        assert stats["tokens"]["cache_read"] == 5
+        assert stats["tokens"]["cache_write"] == 1
+        assert stats["tokens"]["reasoning"] == 7
+        assert stats["tokens"]["total"] == 164
+        assert stats["estimated_cost_usd"] == 0.0165
+        assert stats["exact_message_count"] == 1
+        assert stats["unknown_message_count"] == 1
+        assert len(stats["breakdown"]) == 2
+        assert stats["breakdown"][0]["provider"] == "openai-codex"
+        assert stats["breakdown"][1]["provider"] == "openrouter"
+        assert stats["breakdown"][1]["input_tokens"] == 30
+        assert stats["breakdown"][1]["output_tokens"] == 1
+        assert stats["breakdown"][1]["unknown_message_count"] == 1
+
     def test_parent_session(self, db):
         db.create_session(session_id="parent", source="cli")
         db.create_session(session_id="child", source="cli", parent_session_id="parent")
@@ -512,6 +685,42 @@ class TestMessageStorage:
 
         messages = db.get_messages("s1")
         assert messages[0]["finish_reason"] == "stop"
+
+    def test_assistant_telemetry_persisted_and_restored(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="Done",
+            run_id="run-1",
+            root_run_id="root-1",
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            model="gpt-5.4",
+            api_mode="responses",
+            input_tokens=100,
+            output_tokens=20,
+            cache_read_tokens=5,
+            cache_write_tokens=1,
+            reasoning_tokens=7,
+            estimated_cost_usd=0.0123,
+            usage_status="exact",
+        )
+
+        messages = db.get_messages("s1")
+        assert messages[0]["run_id"] == "run-1"
+        assert messages[0]["root_run_id"] == "root-1"
+        assert messages[0]["provider"] == "openai-codex"
+        assert messages[0]["base_url"] == "https://chatgpt.com/backend-api/codex"
+        assert messages[0]["model"] == "gpt-5.4"
+        assert messages[0]["api_mode"] == "responses"
+        assert messages[0]["input_tokens"] == 100
+        assert messages[0]["output_tokens"] == 20
+        assert messages[0]["cache_read_tokens"] == 5
+        assert messages[0]["cache_write_tokens"] == 1
+        assert messages[0]["reasoning_tokens"] == 7
+        assert messages[0]["estimated_cost_usd"] == 0.0123
+        assert messages[0]["usage_status"] == "exact"
 
     def test_reasoning_persisted_and_restored(self, db):
         """Reasoning text is stored for assistant messages and restored by
@@ -1271,7 +1480,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 7
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1327,12 +1536,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v7
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 7
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")

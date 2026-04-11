@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from hermes_state import AccountingDB
+from hermes_state import AccountingDB, SessionDB
 from run_agent import AIAgent
 from tools.delegate_tool import _build_child_agent
 
@@ -109,6 +109,74 @@ def test_run_conversation_appends_usage_event_to_accounting_db(tmp_path):
         accounting_db.close()
 
 
+def test_run_conversation_persists_assistant_message_telemetry_to_state_db(tmp_path):
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        agent = _make_agent(session_db, platform="telegram")
+
+        result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "done"
+        messages = session_db.get_messages("telegram-session")
+        assistant = next(msg for msg in messages if msg["role"] == "assistant")
+        assert assistant["provider"] == agent.provider
+        assert assistant["base_url"] == agent.base_url
+        assert assistant["model"] == agent.model
+        assert assistant["api_mode"] == agent.api_mode
+        assert assistant["input_tokens"] == 11
+        assert assistant["output_tokens"] == 7
+        assert assistant["cache_read_tokens"] == 0
+        assert assistant["cache_write_tokens"] == 0
+        assert assistant["reasoning_tokens"] == 0
+        assert assistant["usage_status"] == "exact"
+        assert assistant["run_id"] == agent.run_id
+        assert assistant["root_run_id"] == agent.root_run_id
+    finally:
+        session_db.close()
+
+
+def test_run_conversation_rotates_root_run_id_per_new_top_level_turn(tmp_path):
+    accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+    try:
+        session_db = MagicMock()
+        agent = _make_agent(session_db, platform="cli", accounting_db=accounting_db)
+        first_run_id = agent.run_id
+
+        first = agent.run_conversation("hello")
+        second = agent.run_conversation("hello again")
+
+        assert first["final_response"] == "done"
+        assert second["final_response"] == "done"
+        assert agent.run_id != first_run_id
+        assert agent.root_run_id == agent.run_id
+        first_run = accounting_db.get_agent_run(first_run_id)
+        second_run = accounting_db.get_agent_run(agent.run_id)
+        assert first_run is not None and first_run["ended_at"] is not None
+        assert second_run is not None and second_run["ended_at"] is None
+        assert len(accounting_db.get_usage_events(run_id=first_run_id)) == 1
+        assert len(accounting_db.get_usage_events(run_id=agent.run_id)) == 1
+
+        latest = accounting_db.get_latest_root_run_id_for_session("cli-session")
+        assert latest == agent.run_id
+    finally:
+        accounting_db.close()
+
+
+def test_named_profile_root_run_uses_profile_attribution(tmp_path):
+    accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+    try:
+        session_db = MagicMock()
+        with patch("hermes_cli.profiles.get_active_profile_name", return_value="coder"):
+            agent = _make_agent(session_db, platform="cli", accounting_db=accounting_db)
+
+        run = accounting_db.get_agent_run(agent.run_id)
+        assert run is not None
+        assert run["home_id"] == "coder"
+        assert run["profile_name"] == "coder"
+    finally:
+        accounting_db.close()
+
+
 def test_delegate_child_creates_child_run_and_usage_event_in_same_root_ledger(tmp_path):
     accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
     try:
@@ -149,6 +217,53 @@ def test_delegate_child_creates_child_run_and_usage_event_in_same_root_ledger(tm
         assert event["input_tokens"] == 5
         assert event["output_tokens"] == 3
         assert event["usage_status"] == "exact"
+    finally:
+        accounting_db.close()
+
+
+def test_direct_run_records_unknown_usage_event_when_usage_missing(tmp_path):
+    accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+    try:
+        session_db = MagicMock()
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                provider="custom",
+                base_url="http://worker.example/v1",
+                model="worker-model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=session_db,
+                accounting_db=accounting_db,
+                session_id="direct-session",
+                platform="cli",
+            )
+        agent.client = MagicMock()
+        msg = SimpleNamespace(content="done", tool_calls=None)
+        choice = SimpleNamespace(message=msg, finish_reason="stop")
+        agent.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[choice],
+            model="worker-model",
+            usage=None,
+        )
+
+        result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "done"
+        events = accounting_db.get_usage_events(run_id=agent.run_id)
+        assert len(events) == 1
+        event = events[0]
+        assert event["usage_status"] == "unknown"
+        assert event["provider"] == "custom"
+        assert event["base_url"] == "http://worker.example/v1"
+        assert event["model"] == "worker-model"
+        assert event["input_tokens"] == 0
+        assert event["output_tokens"] == 0
     finally:
         accounting_db.close()
 
