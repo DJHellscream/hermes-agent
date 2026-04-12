@@ -217,6 +217,40 @@ class TestAccountingLedger:
 
         assert [row["run_id"] for row in rows] == ["root-run-a"]
 
+    def test_list_root_run_ids_for_sessions_includes_child_session_roots(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="manager-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=100.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run-a",
+            root_run_id="root-run-a",
+            parent_run_id="manager-run-a",
+            local_session_id="session-child",
+            home_id="worker",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+            started_at=110.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="manager-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-b",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=200.0,
+        )
+
+        assert accounting_db.list_root_run_ids_for_sessions(["session-child"]) == ["root-run-a"]
+        assert accounting_db.list_root_run_ids_for_sessions(["session-a", "session-b"]) == ["root-run-a", "root-run-b"]
+
     def test_get_task_usage_summary_accepts_multiple_root_runs(self, accounting_db):
         accounting_db.create_agent_run(
             run_id="root-run-a",

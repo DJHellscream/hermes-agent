@@ -7,6 +7,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
+- GET  /api/accounting             — Hermes-native accounting summary/breakdown/run-tree view
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
@@ -311,6 +312,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._accounting_db: Optional[Any] = None  # Lazy-init AccountingDB for Hermes-native reporting
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -406,7 +408,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # Session DB helper
     # ------------------------------------------------------------------
 
-    def _ensure_session_db(self):
+    def _ensure_session_db(self, *, create_if_missing: bool = True, suppress_errors: bool = True):
         """Lazily initialise and return the shared SessionDB instance.
 
         Sessions are persisted to ``state.db`` so that ``hermes sessions list``
@@ -414,11 +416,176 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         if self._session_db is None:
             try:
-                from hermes_state import SessionDB
-                self._session_db = SessionDB()
+                from hermes_state import SessionDB, DEFAULT_DB_PATH
+                if not create_if_missing and not DEFAULT_DB_PATH.exists():
+                    return None
+                self._session_db = SessionDB(db_path=DEFAULT_DB_PATH)
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
+                if not suppress_errors:
+                    raise
         return self._session_db
+
+    def _ensure_accounting_db(self, *, create_if_missing: bool = True, suppress_errors: bool = True):
+        """Lazily initialise and return the shared AccountingDB instance."""
+        if self._accounting_db is None:
+            try:
+                from hermes_state import AccountingDB, DEFAULT_ACCOUNTING_DB_PATH
+                if not create_if_missing and not DEFAULT_ACCOUNTING_DB_PATH.exists():
+                    return None
+                self._accounting_db = AccountingDB(db_path=DEFAULT_ACCOUNTING_DB_PATH)
+            except Exception as e:
+                logger.debug("AccountingDB unavailable for API server: %s", e)
+                if not suppress_errors:
+                    raise
+        return self._accounting_db
+
+    @staticmethod
+    def _accounting_total_tokens(row: Dict[str, Any]) -> int:
+        return (
+            int(row.get("input_tokens") or 0)
+            + int(row.get("output_tokens") or 0)
+            + int(row.get("cache_read_tokens") or 0)
+            + int(row.get("cache_write_tokens") or 0)
+            + int(row.get("reasoning_tokens") or 0)
+        )
+
+    def _resolve_accounting_request(self, request: "web.Request", accounting_db, session_db):
+        """Resolve API query parameters into a concrete accounting scope."""
+        root_run_id = request.query.get("root_run_id", "").strip()
+        session_id = request.query.get("session_id", "").strip()
+        scope = request.query.get("scope", "").strip().lower()
+        selectors = int(bool(root_run_id)) + int(bool(session_id)) + int(bool(scope))
+
+        if selectors != 1:
+            return None, None, web.json_response(
+                {
+                    "error": (
+                        "Provide exactly one scope selector: root_run_id=<id>, "
+                        "session_id=<id>, or scope=all"
+                    )
+                },
+                status=400,
+            )
+
+        if scope:
+            if scope != "all":
+                return None, None, web.json_response(
+                    {"error": "Invalid scope. Supported values: all"},
+                    status=400,
+                )
+            root_run_ids = [row["root_run_id"] for row in accounting_db.list_root_runs() if row.get("root_run_id")]
+            return {"type": "all", "root_run_ids": root_run_ids}, root_run_ids, None
+
+        if root_run_id:
+            run_tree = accounting_db.get_task_run_tree(root_run_id=root_run_id)
+            if not run_tree:
+                return None, None, web.json_response(
+                    {"error": f"Root run not found: {root_run_id}"},
+                    status=404,
+                )
+            return {
+                "type": "root_run",
+                "root_run_id": root_run_id,
+                "root_run_ids": [root_run_id],
+            }, [root_run_id], None
+
+        session_ids = [session_id]
+        if session_db is not None:
+            session_ids = session_db.get_session_ancestor_ids(session_id) or [session_id]
+        root_run_ids = accounting_db.list_root_run_ids_for_sessions(session_ids)
+        if not root_run_ids:
+            if session_db is None:
+                return None, None, web.json_response(
+                    {
+                        "error": (
+                            "Session lineage metadata was unavailable and exact-session lookup "
+                            f"found no accounting for session: {session_id}"
+                        )
+                    },
+                    status=503,
+                )
+            return None, None, web.json_response(
+                {"error": f"No accounting found for session: {session_id}"},
+                status=404,
+            )
+        return {
+            "type": "session",
+            "session_id": session_id,
+            "root_run_ids": root_run_ids,
+        }, root_run_ids, None
+
+    def _build_accounting_payload(
+        self,
+        scope_info: Dict[str, Any],
+        root_run_ids: List[str],
+        accounting_db,
+        session_db,
+        extra_warnings: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Build the structured JSON payload for /api/accounting."""
+        summary = accounting_db.get_task_usage_summary(root_run_ids=root_run_ids)
+        breakdown = sorted(
+            accounting_db.get_task_usage_breakdown(root_run_ids=root_run_ids),
+            key=lambda row: (
+                self._accounting_total_tokens(row),
+                float(row.get("estimated_cost_usd") or 0.0),
+            ),
+            reverse=True,
+        )
+        run_tree = accounting_db.get_task_run_tree(root_run_ids=root_run_ids)
+        session_links = []
+        try:
+            session_links = accounting_db.get_task_session_links(root_run_ids=root_run_ids, session_db=session_db)
+        except Exception as e:
+            logger.warning("Session link enrichment failed for /api/accounting: %s", e)
+            session_links = accounting_db.get_task_session_links(root_run_ids=root_run_ids, session_db=None)
+            warnings = [{
+                "type": "session_linkage_unavailable",
+                "message": "Session linkage metadata was unavailable; session link details may be partial.",
+            }]
+        else:
+            warnings = []
+
+        try:
+            warnings.extend(
+                accounting_db.get_task_provenance_warnings(root_run_ids=root_run_ids, session_db=session_db)
+            )
+        except Exception as e:
+            logger.warning("Provenance enrichment failed for /api/accounting: %s", e)
+            warnings.extend([
+                {
+                    "type": "session_provenance_unavailable",
+                    "message": "Session provenance metadata was unavailable; provenance warnings may be incomplete.",
+                }
+            ])
+            warnings.extend(
+                accounting_db.get_task_provenance_warnings(root_run_ids=root_run_ids, session_db=None)
+            )
+        if extra_warnings:
+            warnings.extend(extra_warnings)
+
+        root_runs = [run for run in run_tree if run.get("parent_run_id") is None]
+        active_root_count = sum(1 for run in root_runs if run.get("ended_at") is None)
+        if active_root_count == 1:
+            warnings.append({
+                "type": "run_active",
+                "message": "Run is still active; totals may still change.",
+            })
+        elif active_root_count > 1:
+            warnings.append({
+                "type": "run_active",
+                "message": f"{active_root_count} runs are still active; totals may still change.",
+            })
+
+        return {
+            "scope": scope_info,
+            "summary": summary,
+            "breakdown": breakdown,
+            "run_tree": run_tree,
+            "session_links": session_links,
+            "warnings": warnings,
+        }
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -501,6 +668,143 @@ class APIServerAdapter(BasePlatformAdapter):
                 }
             ],
         })
+
+    async def _handle_accounting(self, request: "web.Request") -> "web.Response":
+        """GET /api/accounting — structured accounting for an explicit scope."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        root_run_id = request.query.get("root_run_id", "").strip()
+        session_id = request.query.get("session_id", "").strip()
+        scope = request.query.get("scope", "").strip().lower()
+        selectors = int(bool(root_run_id)) + int(bool(session_id)) + int(bool(scope))
+        if selectors != 1:
+            return web.json_response(
+                {
+                    "error": (
+                        "Provide exactly one scope selector: root_run_id=<id>, "
+                        "session_id=<id>, or scope=all"
+                    )
+                },
+                status=400,
+            )
+        if scope and scope != "all":
+            return web.json_response(
+                {"error": "Invalid scope. Supported values: all"},
+                status=400,
+            )
+
+        try:
+            accounting_db = self._ensure_accounting_db(
+                create_if_missing=False,
+                suppress_errors=False,
+            )
+        except Exception as e:
+            logger.warning("AccountingDB open failed for /api/accounting: %s", e)
+            return web.json_response({"error": "Accounting DB unavailable"}, status=500)
+        if accounting_db is None:
+            if scope == "all":
+                return web.json_response(
+                    {
+                        "scope": {"type": "all", "root_run_ids": []},
+                        "summary": {
+                            "root_run_id": None,
+                            "root_run_ids": [],
+                            "root_run_count": 0,
+                            "manager_only": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "estimated_cost_usd": 0.0,
+                            },
+                            "worker_only": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "estimated_cost_usd": 0.0,
+                            },
+                            "total": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "estimated_cost_usd": 0.0,
+                            },
+                            "exact_event_count": 0,
+                            "unknown_event_count": 0,
+                            "first_event_at": None,
+                            "last_event_at": None,
+                            "child_run_count": 0,
+                        },
+                        "breakdown": [],
+                        "run_tree": [],
+                        "session_links": [],
+                        "warnings": [],
+                    }
+                )
+            if root_run_id:
+                return web.json_response({"error": f"Root run not found: {root_run_id}"}, status=404)
+            return web.json_response({"error": f"No accounting found for session: {session_id}"}, status=404)
+
+        session_db = None
+        extra_warnings: List[Dict[str, Any]] = []
+        if session_id:
+            try:
+                session_db = self._ensure_session_db(
+                    create_if_missing=False,
+                    suppress_errors=False,
+                )
+            except Exception as e:
+                logger.warning("Session lineage lookup failed for /api/accounting: %s", e)
+                session_db = None
+            if session_db is None:
+                extra_warnings.append({
+                    "type": "session_lineage_unavailable",
+                    "message": "Session lineage metadata was unavailable; session-scoped resolution may be partial.",
+                })
+            scope_info, root_run_ids, scope_err = self._resolve_accounting_request(
+                request, accounting_db, session_db
+            )
+        else:
+            scope_info, root_run_ids, scope_err = self._resolve_accounting_request(
+                request, accounting_db, session_db
+            )
+        if scope_err:
+            return scope_err
+
+        if not session_id:
+            try:
+                session_db = self._ensure_session_db(
+                    create_if_missing=False,
+                    suppress_errors=False,
+                )
+            except Exception as e:
+                logger.warning("Optional session metadata lookup failed for /api/accounting: %s", e)
+                session_db = None
+            if session_db is None:
+                extra_warnings.append({
+                    "type": "session_linkage_unavailable",
+                    "message": "Session linkage metadata was unavailable; session link details may be partial.",
+                })
+
+        try:
+            payload = self._build_accounting_payload(
+                scope_info=scope_info,
+                root_run_ids=root_run_ids,
+                accounting_db=accounting_db,
+                session_db=session_db,
+                extra_warnings=extra_warnings,
+            )
+        except Exception as e:
+            logger.warning("Accounting payload build failed for /api/accounting: %s", e)
+            return web.json_response({"error": "Accounting payload unavailable"}, status=500)
+        return web.json_response(payload)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -1633,6 +1937,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/api/accounting", self._handle_accounting)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

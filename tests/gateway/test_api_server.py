@@ -221,6 +221,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
+    app.router.add_get("/api/accounting", adapter._handle_accounting)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -344,6 +345,434 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# /api/accounting endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestAccountingEndpoint:
+    @pytest.mark.asyncio
+    async def test_requires_explicit_scope_selector(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_ensure_accounting_db", side_effect=AssertionError("should not init accounting db")), \
+                 patch.object(adapter, "_ensure_session_db", side_effect=AssertionError("should not init session db")):
+                resp = await cli.get("/api/accounting")
+            assert resp.status == 400
+            data = await resp.json()
+            assert "exactly one" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_invalid_scope_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_ensure_accounting_db", side_effect=AssertionError("should not init accounting db")), \
+                 patch.object(adapter, "_ensure_session_db", side_effect=AssertionError("should not init session db")):
+                resp = await cli.get("/api/accounting?scope=current")
+            assert resp.status == 400
+            data = await resp.json()
+            assert "invalid scope" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_requires_auth_when_api_key_configured(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/accounting?scope=all")
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_accounting_db_open_failure_returns_500(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_ensure_accounting_db", side_effect=RuntimeError("broken db")):
+                resp = await cli.get("/api/accounting?scope=all")
+            assert resp.status == 500
+            data = await resp.json()
+            assert "accounting db unavailable" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_session_scope_falls_back_to_child_session_roots_when_session_db_is_missing(self, adapter, tmp_path):
+        from hermes_state import AccountingDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        try:
+            accounting_db.create_agent_run(
+                run_id="manager-run-a",
+                root_run_id="root-run-a",
+                local_session_id="session-a",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="child-run-a",
+                root_run_id="root-run-a",
+                parent_run_id="manager-run-a",
+                local_session_id="session-b",
+                home_id="worker",
+                profile_name="worker",
+                launch_kind="delegate_task",
+                transport_kind="acp",
+                started_at=110.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="child-run-a",
+                root_run_id="root-run-a",
+                local_session_id="session-b",
+                home_id="worker",
+                profile_name="worker",
+                provider="custom",
+                model="local-model",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
+            adapter._accounting_db = accounting_db
+
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_ensure_session_db", return_value=None):
+                    resp = await cli.get("/api/accounting?session_id=session-b")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["scope"]["root_run_ids"] == ["root-run-a"]
+                assert data["summary"]["root_run_count"] == 1
+                assert data["summary"]["total"]["input_tokens"] == 7
+                assert any(w.get("type") == "session_lineage_unavailable" for w in data["warnings"])
+        finally:
+            accounting_db.close()
+
+    @pytest.mark.asyncio
+    async def test_session_scope_returns_503_when_lineage_db_is_missing_and_only_ancestor_has_accounting(self, adapter, tmp_path):
+        from hermes_state import AccountingDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        try:
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-a",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-a",
+                home_id="default",
+                provider="openai-codex",
+                model="gpt-5.4",
+                input_tokens=9,
+                output_tokens=1,
+                usage_status="exact",
+            )
+            adapter._accounting_db = accounting_db
+
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_ensure_session_db", return_value=None):
+                    resp = await cli.get("/api/accounting?session_id=session-b")
+                assert resp.status == 503
+                data = await resp.json()
+                assert "lineage metadata was unavailable" in data["error"].lower()
+        finally:
+            accounting_db.close()
+
+    @pytest.mark.asyncio
+    async def test_root_run_id_still_returns_payload_when_session_db_is_unavailable(self, adapter, tmp_path):
+        from hermes_state import AccountingDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        try:
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                model="gpt-5.4",
+                input_tokens=10,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            adapter._accounting_db = accounting_db
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_ensure_session_db", side_effect=RuntimeError("session db down")):
+                    resp = await cli.get("/api/accounting?root_run_id=root-run")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["summary"]["root_run_count"] == 1
+                assert any(w.get("type") == "session_linkage_unavailable" for w in data["warnings"])
+        finally:
+            accounting_db.close()
+
+    @pytest.mark.asyncio
+    async def test_accounting_payload_failure_degrades_to_warnings(self, adapter, tmp_path):
+        from hermes_state import AccountingDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        try:
+            accounting_db.create_agent_run(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="session-b",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="session-b",
+                home_id="default",
+                provider="custom",
+                model="local-model",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            adapter._accounting_db = accounting_db
+            adapter._session_db = MagicMock()
+            adapter._session_db.get_session_ancestor_ids.return_value = ["session-b"]
+            adapter._session_db.get_session.side_effect = RuntimeError("session lookup failed")
+
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/accounting?session_id=session-b")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["summary"]["root_run_count"] == 1
+                assert any(w.get("type") == "session_linkage_unavailable" for w in data["warnings"])
+                assert any(w.get("type") == "session_provenance_unavailable" for w in data["warnings"])
+        finally:
+            accounting_db.close()
+
+    @pytest.mark.asyncio
+    async def test_root_run_id_returns_structured_accounting_payload(self, adapter, tmp_path):
+        from hermes_state import AccountingDB, SessionDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="api_server")
+            session_db.create_session(session_id="session-child", source="api_server", parent_session_id="session-root")
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="child-run",
+                root_run_id="root-run",
+                parent_run_id="root-run",
+                local_session_id="session-child",
+                home_id="worker",
+                profile_name="worker",
+                launch_kind="delegate_task",
+                transport_kind="acp",
+                started_at=110.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                model="gpt-5.4",
+                input_tokens=10,
+                output_tokens=2,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="child-run",
+                root_run_id="root-run",
+                local_session_id="session-child",
+                home_id="worker",
+                profile_name="worker",
+                provider="custom",
+                model="local-model",
+                input_tokens=5,
+                output_tokens=1,
+                usage_status="exact",
+            )
+
+            adapter._accounting_db = accounting_db
+            adapter._session_db = session_db
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/accounting?root_run_id=root-run")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["scope"] == {
+                    "type": "root_run",
+                    "root_run_id": "root-run",
+                    "root_run_ids": ["root-run"],
+                }
+                assert data["summary"]["root_run_count"] == 1
+                assert data["summary"]["total"]["input_tokens"] == 15
+                assert data["summary"]["total"]["output_tokens"] == 3
+                assert len(data["run_tree"]) == 2
+                assert len(data["session_links"]) == 2
+                child_link = next(link for link in data["session_links"] if link["run_id"] == "child-run")
+                assert child_link["parent_session_id"] == "session-root"
+                assert child_link["session_rotated"] is True
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    @pytest.mark.asyncio
+    async def test_session_id_aggregates_root_runs_across_ancestor_lineage(self, adapter, tmp_path):
+        from hermes_state import AccountingDB, SessionDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-a", source="api_server")
+            session_db.create_session(session_id="session-b", source="api_server", parent_session_id="session-a")
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-a",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="session-b",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-a",
+                home_id="default",
+                provider="openai-codex",
+                model="gpt-5.4",
+                input_tokens=11,
+                output_tokens=1,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="session-b",
+                home_id="default",
+                provider="custom",
+                model="local-model",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            adapter._accounting_db = accounting_db
+            adapter._session_db = session_db
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/accounting?session_id=session-b")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["scope"] == {
+                    "type": "session",
+                    "session_id": "session-b",
+                    "root_run_ids": ["root-a", "root-b"],
+                }
+                assert data["summary"]["root_run_count"] == 2
+                assert data["summary"]["total"]["input_tokens"] == 18
+                assert data["summary"]["total"]["output_tokens"] == 3
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    @pytest.mark.asyncio
+    async def test_scope_all_returns_all_root_runs(self, adapter, tmp_path):
+        from hermes_state import AccountingDB
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        try:
+            accounting_db.create_agent_run(
+                run_id="manager-run-a",
+                root_run_id="root-a",
+                local_session_id="session-a",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="manager-run-b",
+                root_run_id="root-b",
+                local_session_id="session-b",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="manager-run-a",
+                root_run_id="root-a",
+                local_session_id="session-a",
+                home_id="default",
+                provider="openai-codex",
+                model="gpt-5.4",
+                input_tokens=4,
+                output_tokens=1,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="manager-run-b",
+                root_run_id="root-b",
+                local_session_id="session-b",
+                home_id="default",
+                provider="custom",
+                model="local-model",
+                input_tokens=6,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            adapter._accounting_db = accounting_db
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/accounting?scope=all")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["scope"] == {
+                    "type": "all",
+                    "root_run_ids": ["root-a", "root-b"],
+                }
+                assert data["summary"]["root_run_count"] == 2
+                assert data["summary"]["total"]["input_tokens"] == 10
+                assert data["summary"]["total"]["output_tokens"] == 3
+        finally:
+            accounting_db.close()
 
 
 # ---------------------------------------------------------------------------

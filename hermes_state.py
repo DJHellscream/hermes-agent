@@ -372,6 +372,24 @@ class AccountingDB:
             results.append(item)
         return results
 
+    def list_root_run_ids_for_sessions(self, local_session_ids: List[str]) -> List[str]:
+        cleaned = [str(s).strip() for s in local_session_ids if str(s).strip()]
+        if not cleaned:
+            return []
+        placeholders = ", ".join("?" for _ in cleaned)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT root_run_id, MIN(started_at) AS first_started_at
+                FROM agent_runs
+                WHERE local_session_id IN ({placeholders}) AND root_run_id IS NOT NULL
+                GROUP BY root_run_id
+                ORDER BY first_started_at ASC, root_run_id ASC
+                """,
+                tuple(cleaned),
+            ).fetchall()
+        return [str(row["root_run_id"]).strip() for row in rows if str(row["root_run_id"]).strip()]
+
     def _normalize_root_run_ids(
         self,
         root_run_id: Optional[str] = None,
