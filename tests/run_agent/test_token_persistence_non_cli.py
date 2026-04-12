@@ -316,6 +316,67 @@ def test_acp_run_records_unknown_usage_event_instead_of_fake_zero(tmp_path):
         accounting_db.close()
 
 
+def test_acp_run_uses_actual_runtime_metadata_when_response_provides_it(tmp_path):
+    accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+    try:
+        session_db = MagicMock()
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                provider="copilot-acp",
+                base_url="acp://copilot",
+                acp_command="copilot",
+                acp_args=["--acp", "--stdio"],
+                model="google/gemma-4-26B-A4B-it",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=session_db,
+                accounting_db=accounting_db,
+                session_id="acp-session",
+                platform="cli",
+            )
+        agent.client = MagicMock()
+        msg = SimpleNamespace(content="done", tool_calls=None)
+        choice = SimpleNamespace(message=msg, finish_reason="stop")
+        agent.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[choice],
+            model="google/gemma-4-26B-A4B-it",
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
+            hermes_provider="custom",
+            hermes_base_url="http://superbif:8000/v1",
+            hermes_api_mode="chat_completions",
+        )
+
+        result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "done"
+        assert result["actual_provider"] == "custom"
+        assert result["actual_base_url"] == "http://superbif:8000/v1"
+        assert result["actual_api_mode"] == "chat_completions"
+
+        run = accounting_db.get_agent_run(agent.run_id)
+        assert run is not None
+        assert run["provider_hint"] == "custom"
+        assert run["base_url_hint"] == "http://superbif:8000/v1"
+
+        events = accounting_db.get_usage_events(run_id=agent.run_id)
+        assert len(events) == 1
+        event = events[0]
+        assert event["usage_status"] == "exact"
+        assert event["provider"] == "custom"
+        assert event["base_url"] == "http://superbif:8000/v1"
+        assert event["api_mode"] == "chat_completions"
+        assert event["input_tokens"] == 5
+        assert event["output_tokens"] == 3
+    finally:
+        accounting_db.close()
+
+
 def test_context_compaction_keeps_same_global_run_id(tmp_path):
     accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
     try:

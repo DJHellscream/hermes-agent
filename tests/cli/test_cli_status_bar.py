@@ -462,7 +462,7 @@ class TestCLIAccountingReport:
             session_db.close()
             accounting_db.close()
 
-    def test_show_accounting_current_falls_back_to_session_linkage(self, tmp_path, capsys):
+    def test_show_accounting_current_aggregates_all_roots_for_session(self, tmp_path, capsys):
         cli_obj = _make_cli()
         cli_obj.session_id = "session-root"
         cli_obj.agent = None
@@ -490,8 +490,8 @@ class TestCLIAccountingReport:
                 started_at=200.0,
             )
             accounting_db.append_usage_event(
-                run_id="newer-root",
-                root_run_id="newer-root",
+                run_id="older-root",
+                root_run_id="older-root",
                 local_session_id="session-root",
                 home_id="default",
                 provider="openai-codex",
@@ -501,14 +501,96 @@ class TestCLIAccountingReport:
                 output_tokens=1,
                 usage_status="exact",
             )
+            accounting_db.append_usage_event(
+                run_id="newer-root",
+                root_run_id="newer-root",
+                local_session_id="session-root",
+                home_id="default",
+                provider="custom",
+                base_url="http://superbif:8000/v1",
+                model="google/gemma-4-26B-A4B-it",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
 
             cli_obj._session_db = session_db
             with patch("hermes_state.AccountingDB", return_value=accounting_db):
                 cli_obj._show_accounting("/accounting current")
             output = capsys.readouterr().out
 
-            assert "Root run: newer-root" in output
+            assert "Scope: current session" in output
+            assert "Root runs: 2" in output
             assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
+            assert "custom | google/gemma-4-26B-A4B-it | http://superbif:8000/v1" in output
+            assert "in 12  out 3  total 15" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_aggregates_every_root_run(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            session_db.create_session(session_id="other-session", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="other-session",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=5,
+                output_tokens=1,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="other-session",
+                home_id="default",
+                provider="custom",
+                base_url="http://worker/v1",
+                model="local-model",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "Scope: all" in output
+            assert "Root runs: 2" in output
+            assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
+            assert "custom | local-model | http://worker/v1" in output
+            assert "in 12  out 3  total 15" in output
         finally:
             session_db.close()
             accounting_db.close()

@@ -8606,11 +8606,15 @@ class AIAgent:
                             api_duration, _cache_pct,
                         )
 
+                        actual_provider = getattr(response, "hermes_provider", None) or self.provider
+                        actual_base_url = getattr(response, "hermes_base_url", None) or self.base_url
+                        actual_api_mode = getattr(response, "hermes_api_mode", None) or self.api_mode
+
                         cost_result = estimate_usage_cost(
                             self.model,
                             canonical_usage,
-                            provider=self.provider,
-                            base_url=self.base_url,
+                            provider=actual_provider,
+                            base_url=actual_base_url,
                             api_key=getattr(self, "api_key", ""),
                         )
                         if cost_result.amount_usd is not None:
@@ -8620,10 +8624,10 @@ class AIAgent:
                         self._current_assistant_telemetry = {
                             "run_id": self.run_id,
                             "root_run_id": self.root_run_id,
-                            "provider": self.provider,
-                            "base_url": self.base_url,
+                            "provider": actual_provider,
+                            "base_url": actual_base_url,
                             "model": self.model,
-                            "api_mode": self.api_mode,
+                            "api_mode": actual_api_mode,
                             "input_tokens": canonical_usage.input_tokens,
                             "output_tokens": canonical_usage.output_tokens,
                             "cache_read_tokens": canonical_usage.cache_read_tokens,
@@ -8654,14 +8658,31 @@ class AIAgent:
                                     if cost_result.amount_usd is not None else None,
                                     cost_status=cost_result.status,
                                     cost_source=cost_result.source,
-                                    billing_provider=self.provider,
-                                    billing_base_url=self.base_url,
-                                    billing_mode="subscription_included"
-                                    if cost_result.status == "included" else None,
+                                    billing_provider=actual_provider,
+                                    billing_base_url=actual_base_url,
+                                    billing_mode=actual_api_mode,
                                     model=self.model,
                                 )
                             except Exception:
                                 pass  # never block the agent loop
+
+                        try:
+                            self._accounting_db.create_agent_run(
+                                run_id=self.run_id,
+                                parent_run_id=self.parent_run_id,
+                                root_run_id=self.root_run_id,
+                                local_session_id=self.session_id,
+                                home_id=self.home_id,
+                                profile_name=self.profile_name,
+                                launch_kind=self.launch_kind,
+                                transport_kind=self.transport_kind,
+                                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                                model_hint=self.model,
+                                provider_hint=actual_provider,
+                                base_url_hint=actual_base_url,
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
 
                         try:
                             self._accounting_db.append_usage_event(
@@ -8670,10 +8691,10 @@ class AIAgent:
                                 home_id=self.home_id,
                                 profile_name=self.profile_name,
                                 local_session_id=self.session_id,
-                                provider=self.provider,
-                                base_url=self.base_url,
+                                provider=actual_provider,
+                                base_url=actual_base_url,
                                 model=self.model,
-                                api_mode=self.api_mode,
+                                api_mode=actual_api_mode,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
@@ -8705,13 +8726,16 @@ class AIAgent:
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     else:
+                        actual_provider = getattr(response, "hermes_provider", None) or self.provider
+                        actual_base_url = getattr(response, "hermes_base_url", None) or self.base_url
+                        actual_api_mode = getattr(response, "hermes_api_mode", None) or self.api_mode
                         self._current_assistant_telemetry = {
                             "run_id": self.run_id,
                             "root_run_id": self.root_run_id,
-                            "provider": self.provider,
-                            "base_url": self.base_url,
+                            "provider": actual_provider,
+                            "base_url": actual_base_url,
                             "model": self.model,
-                            "api_mode": self.api_mode,
+                            "api_mode": actual_api_mode,
                             "input_tokens": 0,
                             "output_tokens": 0,
                             "cache_read_tokens": 0,
@@ -8721,16 +8745,33 @@ class AIAgent:
                             "usage_status": "unknown",
                         }
                         try:
+                            self._accounting_db.create_agent_run(
+                                run_id=self.run_id,
+                                parent_run_id=self.parent_run_id,
+                                root_run_id=self.root_run_id,
+                                local_session_id=self.session_id,
+                                home_id=self.home_id,
+                                profile_name=self.profile_name,
+                                launch_kind=self.launch_kind,
+                                transport_kind=self.transport_kind,
+                                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                                model_hint=self.model,
+                                provider_hint=actual_provider,
+                                base_url_hint=actual_base_url,
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
+                        try:
                             self._accounting_db.append_usage_event(
                                 run_id=self.run_id,
                                 root_run_id=self.root_run_id,
                                 home_id=self.home_id,
                                 profile_name=self.profile_name,
                                 local_session_id=self.session_id,
-                                provider=self.provider,
-                                base_url=self.base_url,
+                                provider=actual_provider,
+                                base_url=actual_base_url,
                                 model=self.model,
-                                api_mode=self.api_mode,
+                                api_mode=actual_api_mode,
                                 input_tokens=0,
                                 output_tokens=0,
                                 cache_read_tokens=0,
@@ -10277,6 +10318,7 @@ class AIAgent:
                 break
 
         # Build result with interrupt info if applicable
+        actual_runtime_meta = getattr(self, "_current_assistant_telemetry", None) or {}
         result = {
             "final_response": final_response,
             "last_reasoning": last_reasoning,
@@ -10289,6 +10331,9 @@ class AIAgent:
             "model": self.model,
             "provider": self.provider,
             "base_url": self.base_url,
+            "actual_provider": actual_runtime_meta.get("provider") or self.provider,
+            "actual_base_url": actual_runtime_meta.get("base_url") or self.base_url,
+            "actual_api_mode": actual_runtime_meta.get("api_mode") or self.api_mode,
             "input_tokens": self.session_input_tokens,
             "output_tokens": self.session_output_tokens,
             "cache_read_tokens": self.session_cache_read_tokens,
