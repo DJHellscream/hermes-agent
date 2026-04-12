@@ -313,7 +313,7 @@ class CopilotACPClient:
             tools=tools,
             tool_choice=tool_choice,
         )
-        response_text, reasoning_text, usage_data = self._run_prompt(
+        response_text, reasoning_text, usage_data, runtime_meta = self._run_prompt(
             prompt_text,
             timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS),
         )
@@ -347,9 +347,17 @@ class CopilotACPClient:
             choices=[choice],
             usage=usage,
             model=model or "copilot-acp",
+            hermes_provider=(runtime_meta or {}).get("provider"),
+            hermes_base_url=(runtime_meta or {}).get("base_url"),
+            hermes_api_mode=(runtime_meta or {}).get("api_mode"),
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str, dict[str, Any] | None]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -488,7 +496,18 @@ class CopilotACPClient:
                 reasoning_parts=reasoning_parts,
             ) or {}
             usage_data = prompt_result.get("usage") if isinstance(prompt_result, dict) else None
-            return "".join(text_parts), "".join(reasoning_parts), usage_data
+            runtime_meta = None
+            if isinstance(prompt_result, dict):
+                raw_meta = prompt_result.get("_meta") or prompt_result.get("meta")
+                if isinstance(raw_meta, dict):
+                    candidate = raw_meta.get("hermesRuntime")
+                    if isinstance(candidate, dict):
+                        runtime_meta = {
+                            "provider": candidate.get("provider"),
+                            "base_url": candidate.get("base_url"),
+                            "api_mode": candidate.get("api_mode"),
+                        }
+            return "".join(text_parts), "".join(reasoning_parts), usage_data, runtime_meta
         finally:
             self.close()
 

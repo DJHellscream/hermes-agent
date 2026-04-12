@@ -349,6 +349,48 @@ class AccountingDB:
             ).fetchone()
         return None if row is None else row["root_run_id"]
 
+    def list_root_runs(self, local_session_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        clauses = ["parent_run_id IS NULL"]
+        params: List[Any] = []
+        if local_session_ids is not None:
+            cleaned = [str(s).strip() for s in local_session_ids if str(s).strip()]
+            if not cleaned:
+                return []
+            placeholders = ", ".join("?" for _ in cleaned)
+            clauses.append(f"local_session_id IN ({placeholders})")
+            params.extend(cleaned)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM agent_runs {where_sql} ORDER BY started_at ASC, run_id ASC",
+                tuple(params),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["metadata_json"] = self._decode_json(item.get("metadata_json"))
+            results.append(item)
+        return results
+
+    def _normalize_root_run_ids(
+        self,
+        root_run_id: Optional[str] = None,
+        root_run_ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        if root_run_ids is not None:
+            ordered: List[str] = []
+            seen: set[str] = set()
+            for value in root_run_ids:
+                cleaned = str(value or "").strip()
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    ordered.append(cleaned)
+            return ordered
+        if root_run_id is not None:
+            cleaned = str(root_run_id).strip()
+            return [cleaned] if cleaned else []
+        return [row["run_id"] for row in self.list_root_runs()]
+
     def append_usage_event(
         self,
         *,
@@ -409,15 +451,25 @@ class AccountingDB:
 
         return self._execute_write(_do)
 
-    def get_usage_events(self, *, run_id: str = None, root_run_id: str = None) -> List[Dict[str, Any]]:
+    def get_usage_events(
+        self,
+        *,
+        run_id: str = None,
+        root_run_id: str = None,
+        root_run_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         clauses = []
         params: List[Any] = []
         if run_id is not None:
             clauses.append("run_id = ?")
             params.append(run_id)
-        if root_run_id is not None:
-            clauses.append("root_run_id = ?")
-            params.append(root_run_id)
+        normalized_root_ids = self._normalize_root_run_ids(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        if run_id is None and (root_run_id is not None or root_run_ids is not None):
+            if not normalized_root_ids:
+                return []
+            placeholders = ", ".join("?" for _ in normalized_root_ids)
+            clauses.append(f"root_run_id IN ({placeholders})")
+            params.extend(normalized_root_ids)
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             rows = self._conn.execute(
@@ -431,12 +483,27 @@ class AccountingDB:
             results.append(item)
         return results
 
-    def get_task_run_tree(self, root_run_id: str) -> List[Dict[str, Any]]:
+    def get_task_run_tree(
+        self,
+        root_run_id: Optional[str] = None,
+        *,
+        root_run_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized_root_ids = self._normalize_root_run_ids(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        if (root_run_id is not None or root_run_ids is not None) and not normalized_root_ids:
+            return []
+        if normalized_root_ids:
+            placeholders = ", ".join("?" for _ in normalized_root_ids)
+            query = (
+                f"SELECT * FROM agent_runs WHERE root_run_id IN ({placeholders}) "
+                "ORDER BY started_at ASC, run_id ASC"
+            )
+            params: tuple[Any, ...] = tuple(normalized_root_ids)
+        else:
+            query = "SELECT * FROM agent_runs ORDER BY started_at ASC, run_id ASC"
+            params = ()
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM agent_runs WHERE root_run_id = ? ORDER BY started_at ASC, run_id ASC",
-                (root_run_id,),
-            ).fetchall()
+            rows = self._conn.execute(query, params).fetchall()
         results = []
         for row in rows:
             item = dict(row)
@@ -463,17 +530,25 @@ class AccountingDB:
             totals["estimated_cost_usd"] += float(row.get("estimated_cost_usd") or 0.0)
         return totals
 
-    def get_task_usage_summary(self, root_run_id: str) -> Dict[str, Any]:
-        runs = self.get_task_run_tree(root_run_id)
-        events = self.get_usage_events(root_run_id=root_run_id)
-        root_run_ids = {r["run_id"] for r in runs if r.get("parent_run_id") is None and r.get("run_id") == root_run_id}
-        manager_events = [e for e in events if e.get("run_id") in root_run_ids]
-        worker_events = [e for e in events if e.get("run_id") not in root_run_ids]
+    def get_task_usage_summary(
+        self,
+        root_run_id: Optional[str] = None,
+        *,
+        root_run_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        normalized_root_ids = self._normalize_root_run_ids(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        runs = self.get_task_run_tree(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        events = self.get_usage_events(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        root_run_id_set = {r["run_id"] for r in runs if r.get("parent_run_id") is None}
+        manager_events = [e for e in events if e.get("run_id") in root_run_id_set]
+        worker_events = [e for e in events if e.get("run_id") not in root_run_id_set]
         exact_count = sum(1 for e in events if e.get("usage_status") == "exact")
         unknown_count = sum(1 for e in events if e.get("usage_status") != "exact")
         timestamps = [float(e.get("recorded_at")) for e in events if e.get("recorded_at") is not None]
         return {
-            "root_run_id": root_run_id,
+            "root_run_id": normalized_root_ids[0] if len(normalized_root_ids) == 1 else None,
+            "root_run_ids": normalized_root_ids,
+            "root_run_count": len(root_run_id_set),
             "manager_only": self._sum_usage_rows(manager_events),
             "worker_only": self._sum_usage_rows(worker_events),
             "total": self._sum_usage_rows(events),
@@ -484,9 +559,17 @@ class AccountingDB:
             "child_run_count": sum(1 for r in runs if r.get("parent_run_id") is not None),
         }
 
-    def get_task_usage_breakdown(self, root_run_id: str) -> List[Dict[str, Any]]:
-        events = self.get_usage_events(root_run_id=root_run_id)
-        runs_by_id = {r["run_id"]: r for r in self.get_task_run_tree(root_run_id)}
+    def get_task_usage_breakdown(
+        self,
+        root_run_id: Optional[str] = None,
+        *,
+        root_run_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        events = self.get_usage_events(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        runs_by_id = {
+            r["run_id"]: r
+            for r in self.get_task_run_tree(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        }
         grouped: Dict[tuple, Dict[str, Any]] = {}
         for e in events:
             run = runs_by_id.get(e.get("run_id"), {})
@@ -532,9 +615,15 @@ class AccountingDB:
                 row["unknown_event_count"] += 1
         return list(grouped.values())
 
-    def get_task_session_links(self, root_run_id: str, *, session_db=None) -> List[Dict[str, Any]]:
+    def get_task_session_links(
+        self,
+        root_run_id: Optional[str] = None,
+        *,
+        root_run_ids: Optional[List[str]] = None,
+        session_db=None,
+    ) -> List[Dict[str, Any]]:
         links = []
-        for run in self.get_task_run_tree(root_run_id):
+        for run in self.get_task_run_tree(root_run_id=root_run_id, root_run_ids=root_run_ids):
             local_session_id = run.get("local_session_id")
             parent_session_id = None
             if session_db is not None and local_session_id:
@@ -550,17 +639,24 @@ class AccountingDB:
             })
         return links
 
-    def get_task_provenance_warnings(self, root_run_id: str, *, session_db=None) -> List[Dict[str, Any]]:
+    def get_task_provenance_warnings(
+        self,
+        root_run_id: Optional[str] = None,
+        *,
+        root_run_ids: Optional[List[str]] = None,
+        session_db=None,
+    ) -> List[Dict[str, Any]]:
         warnings: List[Dict[str, Any]] = []
-        events = self.get_usage_events(root_run_id=root_run_id)
+        events = self.get_usage_events(root_run_id=root_run_id, root_run_ids=root_run_ids)
+        normalized_root_ids = self._normalize_root_run_ids(root_run_id=root_run_id, root_run_ids=root_run_ids)
         if any(e.get("usage_status") != "exact" for e in events):
             warnings.append({
                 "type": "unknown_usage",
-                "root_run_id": root_run_id,
+                "root_run_id": normalized_root_ids[0] if len(normalized_root_ids) == 1 else None,
                 "message": "One or more usage events are non-exact and should be treated cautiously.",
             })
         if session_db is not None:
-            for run in self.get_task_run_tree(root_run_id):
+            for run in self.get_task_run_tree(root_run_id=root_run_id, root_run_ids=root_run_ids):
                 local_session_id = run.get("local_session_id")
                 if local_session_id and session_db.get_session(local_session_id) is None:
                     warnings.append({
@@ -1081,6 +1177,25 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def get_session_ancestor_ids(self, session_id: str) -> List[str]:
+        """Return the current session id plus its parent chain, oldest-first."""
+        cleaned = str(session_id or "").strip()
+        if not cleaned:
+            return []
+        ordered: List[str] = []
+        seen: set[str] = set()
+        current = cleaned
+        while current and current not in seen:
+            seen.add(current)
+            ordered.append(current)
+            session = self.get_session(current)
+            if not session:
+                break
+            parent = session.get("parent_session_id")
+            current = str(parent).strip() if parent else ""
+        ordered.reverse()
+        return ordered
 
     @staticmethod
     def _build_stats_token_dict(

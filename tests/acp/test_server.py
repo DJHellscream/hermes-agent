@@ -424,6 +424,38 @@ class TestPrompt:
         assert resp.usage.cached_read_tokens == 7
 
     @pytest.mark.asyncio
+    async def test_prompt_returns_runtime_metadata_in_meta(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "Hello!",
+            "messages": [],
+            "input_tokens": 123,
+            "output_tokens": 45,
+            "total_tokens": 168,
+            "actual_provider": "custom",
+            "actual_base_url": "http://superbif:8000/v1",
+            "actual_api_mode": "chat_completions",
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert isinstance(resp, PromptResponse)
+        assert resp.field_meta == {
+            "hermesRuntime": {
+                "provider": "custom",
+                "base_url": "http://superbif:8000/v1",
+                "api_mode": "chat_completions",
+            }
+        }
+
+    @pytest.mark.asyncio
     async def test_prompt_updates_history(self, agent):
         """After a prompt, session history should be updated."""
         new_resp = await agent.new_session(cwd=".")

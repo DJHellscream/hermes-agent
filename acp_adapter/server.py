@@ -476,8 +476,21 @@ class HermesACPAgent(acp.Agent):
                 cached_read_tokens=cached_tokens,
             )
 
+        runtime_meta = None
+        actual_provider = result.get("actual_provider") if isinstance(result, dict) else None
+        actual_base_url = result.get("actual_base_url") if isinstance(result, dict) else None
+        actual_api_mode = result.get("actual_api_mode") if isinstance(result, dict) else None
+        if any(value for value in (actual_provider, actual_base_url, actual_api_mode)):
+            runtime_meta = {
+                "hermesRuntime": {
+                    "provider": actual_provider,
+                    "base_url": actual_base_url,
+                    "api_mode": actual_api_mode,
+                }
+            }
+
         stop_reason = "cancelled" if state.cancel_event and state.cancel_event.is_set() else "end_turn"
-        return PromptResponse(stop_reason=stop_reason, usage=usage)
+        return PromptResponse(stop_reason=stop_reason, usage=usage, field_meta=runtime_meta)
 
     # ---- Slash commands (headless) -------------------------------------------
 

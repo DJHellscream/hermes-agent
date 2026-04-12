@@ -182,6 +182,168 @@ class TestAccountingLedger:
         assert accounting_db.get_latest_root_run_id_for_session("session-a") == "root-run-b"
         assert accounting_db.get_latest_root_run_id_for_session("missing-session") is None
 
+    def test_list_root_runs_filters_to_root_runs_for_sessions(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=100.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run-a",
+            root_run_id="root-run-a",
+            parent_run_id="root-run-a",
+            local_session_id="session-child",
+            home_id="worker",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+            started_at=110.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="root-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-b",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=200.0,
+        )
+
+        rows = accounting_db.list_root_runs(local_session_ids=["session-a", "session-child"])
+
+        assert [row["run_id"] for row in rows] == ["root-run-a"]
+
+    def test_get_task_usage_summary_accepts_multiple_root_runs(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=100.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="root-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=200.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="child-run-b",
+            root_run_id="root-run-b",
+            parent_run_id="root-run-b",
+            local_session_id="session-child",
+            home_id="worker",
+            profile_name="worker",
+            launch_kind="delegate_task",
+            transport_kind="acp",
+            started_at=210.0,
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            provider="openai-codex",
+            model="gpt-5.4",
+            input_tokens=100,
+            output_tokens=10,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-a",
+            home_id="default",
+            provider="openai-codex",
+            model="gpt-5.4",
+            input_tokens=40,
+            output_tokens=4,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="child-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-child",
+            home_id="worker",
+            profile_name="worker",
+            provider="custom",
+            model="local-model",
+            input_tokens=20,
+            output_tokens=2,
+            usage_status="unknown",
+        )
+
+        summary = accounting_db.get_task_usage_summary(root_run_ids=["root-run-a", "root-run-b"])
+        assert summary["root_run_id"] is None
+        assert summary["root_run_ids"] == ["root-run-a", "root-run-b"]
+        assert summary["root_run_count"] == 2
+        assert summary["manager_only"]["input_tokens"] == 140
+        assert summary["manager_only"]["output_tokens"] == 14
+        assert summary["worker_only"]["input_tokens"] == 20
+        assert summary["worker_only"]["output_tokens"] == 2
+        assert summary["total"]["input_tokens"] == 160
+        assert summary["total"]["output_tokens"] == 16
+        assert summary["exact_event_count"] == 2
+        assert summary["unknown_event_count"] == 1
+        assert summary["child_run_count"] == 1
+
+    def test_get_task_usage_summary_without_root_filter_aggregates_all_roots(self, accounting_db):
+        accounting_db.create_agent_run(
+            run_id="root-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=100.0,
+        )
+        accounting_db.create_agent_run(
+            run_id="root-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-b",
+            home_id="default",
+            launch_kind="root",
+            transport_kind="direct",
+            started_at=200.0,
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run-a",
+            root_run_id="root-run-a",
+            local_session_id="session-a",
+            home_id="default",
+            provider="openai-codex",
+            model="gpt-5.4",
+            input_tokens=10,
+            output_tokens=1,
+            usage_status="exact",
+        )
+        accounting_db.append_usage_event(
+            run_id="root-run-b",
+            root_run_id="root-run-b",
+            local_session_id="session-b",
+            home_id="default",
+            provider="custom",
+            model="local-model",
+            input_tokens=20,
+            output_tokens=2,
+            usage_status="exact",
+        )
+
+        summary = accounting_db.get_task_usage_summary()
+        assert summary["root_run_count"] == 2
+        assert summary["total"]["input_tokens"] == 30
+        assert summary["total"]["output_tokens"] == 3
+        assert summary["exact_event_count"] == 2
+
     def test_get_task_usage_summary_returns_manager_worker_and_total(self, accounting_db):
         accounting_db.create_agent_run(
             run_id="root-run",
@@ -430,6 +592,14 @@ class TestSessionLifecycle:
 
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None
+
+    def test_get_session_ancestor_ids_returns_current_and_ancestors(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli", parent_session_id="s1")
+        db.create_session(session_id="s3", source="cli", parent_session_id="s2")
+
+        assert db.get_session_ancestor_ids("s3") == ["s1", "s2", "s3"]
+        assert db.get_session_ancestor_ids("missing") == ["missing"]
 
     def test_end_session(self, db):
         db.create_session(session_id="s1", source="cli")

@@ -5723,26 +5723,30 @@ class HermesCLI:
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
 
-    def _resolve_accounting_root_run_id(self, target: str, accounting_db) -> str | None:
+    def _resolve_accounting_scope(self, target: str, accounting_db, session_db) -> tuple[str, list[str]]:
         target = (target or "current").strip()
-        if target and target.lower() != "current":
-            return target
-
-        agent = getattr(self, "agent", None)
-        root_run_id = getattr(agent, "root_run_id", None)
-        if root_run_id:
-            return root_run_id
-
-        run_id = getattr(agent, "run_id", None)
-        if run_id:
-            run = accounting_db.get_agent_run(run_id)
-            if run and run.get("root_run_id"):
-                return run["root_run_id"]
+        lowered = target.lower()
+        if lowered == "all":
+            return "all", [row["run_id"] for row in accounting_db.list_root_runs()]
+        if target and lowered != "current":
+            return "root run", [target]
 
         session_id = getattr(self, "session_id", None)
+        session_ids: list[str] = []
         if session_id:
-            return accounting_db.get_latest_root_run_id_for_session(session_id)
-        return None
+            if session_db is not None:
+                session_ids = session_db.get_session_ancestor_ids(session_id)
+            else:
+                session_ids = [session_id]
+        root_runs = accounting_db.list_root_runs(local_session_ids=session_ids) if session_ids else []
+        if not root_runs:
+            agent = getattr(self, "agent", None)
+            root_run_id = getattr(agent, "root_run_id", None)
+            if root_run_id:
+                run = accounting_db.get_agent_run(root_run_id)
+                if run is not None:
+                    root_runs = [run]
+        return "current session", [row["run_id"] for row in root_runs if row.get("run_id")]
 
     @staticmethod
     def _accounting_total_tokens(row: dict) -> int:
@@ -5789,7 +5793,7 @@ class HermesCLI:
         return (run_id or "unknown")[:8]
 
     def _show_accounting(self, command: str = "/accounting"):
-        """Show task-tree accounting for the current or specified root run."""
+        """Show accounting for the current session, all runs, or a specific root run."""
         from hermes_state import AccountingDB, SessionDB
 
         parts = command.split(maxsplit=1)
@@ -5811,62 +5815,97 @@ class HermesCLI:
                 session_db = None
 
         try:
-            root_run_id = self._resolve_accounting_root_run_id(target, accounting_db)
-            if not root_run_id:
-                print("(._.) No current task accounting found.")
+            scope_label, root_run_ids = self._resolve_accounting_scope(target, accounting_db, session_db)
+            if not root_run_ids:
+                print("(._.) No accounting found for the requested scope.")
                 return
 
-            root_run = accounting_db.get_agent_run(root_run_id)
-            if root_run is None:
-                print(f"(._.) Root run not found: {root_run_id}")
+            run_tree = accounting_db.get_task_run_tree(root_run_ids=root_run_ids)
+            if not run_tree:
+                if scope_label == "root run":
+                    print(f"(._.) Root run not found: {target}")
+                else:
+                    print("(._.) No accounting found for the requested scope.")
                 return
 
-            summary = accounting_db.get_task_usage_summary(root_run_id)
+            summary = accounting_db.get_task_usage_summary(root_run_ids=root_run_ids)
             breakdown = sorted(
-                accounting_db.get_task_usage_breakdown(root_run_id),
+                accounting_db.get_task_usage_breakdown(root_run_ids=root_run_ids),
                 key=lambda row: (
                     self._accounting_total_tokens(row),
                     float(row.get("estimated_cost_usd") or 0.0),
                 ),
                 reverse=True,
             )
-            run_tree = accounting_db.get_task_run_tree(root_run_id)
-            session_links = accounting_db.get_task_session_links(root_run_id, session_db=session_db)
-            warnings = list(accounting_db.get_task_provenance_warnings(root_run_id, session_db=session_db))
-            if root_run.get("ended_at") is None:
+            session_links = accounting_db.get_task_session_links(root_run_ids=root_run_ids, session_db=session_db)
+            warnings = list(accounting_db.get_task_provenance_warnings(root_run_ids=root_run_ids, session_db=session_db))
+
+            root_runs = [run for run in run_tree if run.get("parent_run_id") is None]
+            active_root_count = sum(1 for run in root_runs if run.get("ended_at") is None)
+            if active_root_count == 1:
                 warnings.append({
                     "type": "run_active",
                     "message": "Run is still active; totals may still change.",
                 })
+            elif active_root_count > 1:
+                warnings.append({
+                    "type": "run_active",
+                    "message": f"{active_root_count} runs are still active; totals may still change.",
+                })
 
-            root_link = next((link for link in session_links if link.get("run_id") == root_run_id), None)
-            child_sessions = [
+            single_root = len(root_runs) == 1
+            root_run = root_runs[0] if single_root else None
+            root_sessions = sorted({
                 link.get("local_session_id")
                 for link in session_links
-                if link.get("run_id") != root_run_id and link.get("local_session_id")
-            ]
+                if link.get("local_session_id") and link.get("run_id") in {run.get("run_id") for run in root_runs}
+            })
+            child_sessions = sorted({
+                link.get("local_session_id")
+                for link in session_links
+                if link.get("local_session_id") and link.get("run_id") not in {run.get("run_id") for run in root_runs}
+            })
+            started_candidates = [run.get("started_at") for run in root_runs if run.get("started_at") is not None]
+            ended_candidates = [run.get("ended_at") for run in root_runs if run.get("ended_at") is not None]
 
             def _print_totals(label: str, row: dict) -> None:
                 print(f"  {label:<14} {self._format_accounting_usage_summary(row)}")
 
-            print("Task accounting")
-            print(f"Root run: {root_run_id}")
-            print(f"Started: {self._format_accounting_timestamp(root_run.get('started_at'))}")
+            def _run_usage_row(run_id: str) -> dict:
+                rows = [item for item in breakdown if item.get("run_id") == run_id]
+                return {
+                    "input_tokens": sum(int(item.get("input_tokens") or 0) for item in rows),
+                    "output_tokens": sum(int(item.get("output_tokens") or 0) for item in rows),
+                    "cache_read_tokens": sum(int(item.get("cache_read_tokens") or 0) for item in rows),
+                    "cache_write_tokens": sum(int(item.get("cache_write_tokens") or 0) for item in rows),
+                    "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in rows),
+                }
+
+            print("Task accounting" if single_root else "Accounting")
+            print(f"Scope: {scope_label}")
+            print(f"Root runs: {summary['root_run_count']}")
+            if single_root and root_run is not None:
+                print(f"Root run: {root_run.get('run_id')}")
+            print(
+                f"Started: {self._format_accounting_timestamp(min(started_candidates) if started_candidates else None)}"
+            )
             print(
                 "Ended: "
                 + (
-                    self._format_accounting_timestamp(root_run.get("ended_at"))
-                    if root_run.get("ended_at") is not None
-                    else "running"
+                    self._format_accounting_timestamp(max(ended_candidates) if ended_candidates else None)
+                    if active_root_count == 0 else "running"
                 )
             )
-            print(f"Session: {root_run.get('local_session_id') or 'n/a'}")
-            print(f"Home: {root_run.get('home_id') or 'n/a'}")
+            if single_root and root_run is not None:
+                print(f"Session: {root_run.get('local_session_id') or 'n/a'}")
+                print(f"Home: {root_run.get('home_id') or 'n/a'}")
+            else:
+                print(f"Sessions: {', '.join(root_sessions) if root_sessions else 'n/a'}")
             print()
             print("Totals")
             _print_totals("Root agent only", summary["manager_only"])
             _print_totals("Subagents only", summary["worker_only"])
-            _print_totals("Whole task", summary["total"])
+            _print_totals("Whole task" if single_root else "Whole scope", summary["total"])
             print()
             print("Usage status")
             print(f"  Exact events:    {summary['exact_event_count']}")
@@ -5902,17 +5941,7 @@ class HermesCLI:
             if run_tree:
                 for run in run_tree:
                     role = "root" if run.get("parent_run_id") is None else "child"
-                    if role == "root":
-                        row = summary["manager_only"]
-                    else:
-                        child_rows = [item for item in breakdown if item.get("run_id") == run.get("run_id")]
-                        row = {
-                            "input_tokens": sum(int(item.get("input_tokens") or 0) for item in child_rows),
-                            "output_tokens": sum(int(item.get("output_tokens") or 0) for item in child_rows),
-                            "cache_read_tokens": sum(int(item.get("cache_read_tokens") or 0) for item in child_rows),
-                            "cache_write_tokens": sum(int(item.get("cache_write_tokens") or 0) for item in child_rows),
-                            "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in child_rows),
-                        }
+                    row = _run_usage_row(run.get("run_id"))
                     unknown_count = sum(
                         int(item.get("unknown_event_count") or 0)
                         for item in breakdown
@@ -5931,7 +5960,10 @@ class HermesCLI:
             print()
 
             print("Session links")
-            print(f"  root run session:   {(root_link or {}).get('local_session_id') or 'n/a'}")
+            if single_root:
+                print(f"  root run session:   {root_sessions[0] if root_sessions else 'n/a'}")
+            else:
+                print(f"  root run sessions:  {', '.join(root_sessions) if root_sessions else 'n/a'}")
             print(f"  child sessions:     {', '.join(child_sessions) if child_sessions else 'none'}")
             print()
 
