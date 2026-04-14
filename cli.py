@@ -6813,10 +6813,10 @@ class HermesCLI:
                     "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in rows),
                 }
 
-            print("Task accounting" if single_root else "Accounting")
+            print("Accounting" if compact_all_scope or not single_root else "Task accounting")
             print(f"Scope: {scope_label}")
             print(f"Root runs: {summary['root_run_count']}")
-            if single_root and root_run is not None:
+            if not compact_all_scope and single_root and root_run is not None:
                 print(f"Root run: {root_run.get('run_id')}")
             print(
                 f"Started: {self._format_accounting_timestamp(min(started_candidates) if started_candidates else None)}"
@@ -6833,7 +6833,7 @@ class HermesCLI:
                     )
                 )
             )
-            if single_root and root_run is not None:
+            if not compact_all_scope and single_root and root_run is not None:
                 print(f"Session: {root_run.get('local_session_id') or 'n/a'}")
                 print(f"Home: {root_run.get('home_id') or 'n/a'}")
             else:
@@ -6845,7 +6845,7 @@ class HermesCLI:
             print("Totals")
             _print_totals("Root agent only", summary["manager_only"])
             _print_totals("Subagents only", summary["worker_only"])
-            _print_totals("Whole task" if single_root else "Whole scope", summary["total"])
+            _print_totals("Whole scope" if compact_all_scope else ("Whole task" if single_root else "Whole scope"), summary["total"])
             print()
             print("Usage status")
             print(f"  Exact events:    {summary['exact_event_count']}")

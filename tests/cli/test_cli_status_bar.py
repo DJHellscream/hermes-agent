@@ -745,6 +745,56 @@ class TestCLIAccountingReport:
             session_db.close()
             accounting_db.close()
 
+    def test_show_accounting_all_keeps_summary_shape_with_single_root(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=5,
+                output_tokens=1,
+                usage_status="exact",
+            )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "Accounting\nScope: all" in output
+            assert "Task accounting" not in output
+            assert "Root run:" not in output
+            assert "Session:" not in output
+            assert "Home:" not in output
+            assert "Sessions: 1 total" in output
+            assert "Whole scope" in output
+            assert "Whole task" not in output
+            assert "Run tree" not in output
+            assert "Session links" not in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
     def test_show_accounting_all_reports_mixed_lifecycle_when_some_roots_ended(self, tmp_path, capsys):
         cli_obj = _make_cli()
         cli_obj.session_id = "session-root"
