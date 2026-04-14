@@ -454,17 +454,46 @@ class HermesACPAgent(acp.Agent):
             await conn.session_update(session_id, update)
 
         usage = None
-        if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+        usage_data = result.get("usage")
+        if not usage_data and isinstance(result, dict):
+            usage_data = {
+                "prompt_tokens": result.get("prompt_tokens", result.get("input_tokens", 0)),
+                "completion_tokens": result.get("completion_tokens", result.get("output_tokens", 0)),
+                "total_tokens": result.get("total_tokens", 0),
+                "reasoning_tokens": result.get("reasoning_tokens"),
+                "cached_tokens": result.get("cache_read_tokens"),
+            }
+            if not any(v not in (None, 0) for v in usage_data.values()):
+                usage_data = None
+        if usage_data and isinstance(usage_data, dict):
+            prompt_tokens = usage_data.get("prompt_tokens", usage_data.get("input_tokens", usage_data.get("inputTokens", 0)))
+            completion_tokens = usage_data.get("completion_tokens", usage_data.get("output_tokens", usage_data.get("outputTokens", 0)))
+            total_tokens = usage_data.get("total_tokens", usage_data.get("totalTokens", 0))
+            reasoning_tokens = usage_data.get("reasoning_tokens", usage_data.get("thoughtTokens"))
+            cached_tokens = usage_data.get("cached_tokens", usage_data.get("cache_read_tokens", usage_data.get("cachedReadTokens")))
             usage = Usage(
-                input_tokens=result.get("prompt_tokens", 0),
-                output_tokens=result.get("completion_tokens", 0),
-                total_tokens=result.get("total_tokens", 0),
-                thought_tokens=result.get("reasoning_tokens"),
-                cached_read_tokens=result.get("cache_read_tokens"),
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                thought_tokens=reasoning_tokens,
+                cached_read_tokens=cached_tokens,
             )
 
+        runtime_meta = None
+        actual_provider = result.get("actual_provider") if isinstance(result, dict) else None
+        actual_base_url = result.get("actual_base_url") if isinstance(result, dict) else None
+        actual_api_mode = result.get("actual_api_mode") if isinstance(result, dict) else None
+        if any(value for value in (actual_provider, actual_base_url, actual_api_mode)):
+            runtime_meta = {
+                "hermesRuntime": {
+                    "provider": actual_provider,
+                    "base_url": actual_base_url,
+                    "api_mode": actual_api_mode,
+                }
+            }
+
         stop_reason = "cancelled" if state.cancel_event and state.cancel_event.is_set() else "end_turn"
-        return PromptResponse(stop_reason=stop_reason, usage=usage)
+        return PromptResponse(stop_reason=stop_reason, usage=usage, field_meta=runtime_meta)
 
     # ---- Slash commands (headless) -------------------------------------------
 

@@ -4477,6 +4477,53 @@ class HermesCLI:
             _ask()
         return result[0]
 
+    def _interactive_provider_selection(
+        self, providers: list, current_model: str, current_provider: str
+    ) -> str | None:
+        """Show provider picker, return slug or None on cancel."""
+        choices = []
+        for p in providers:
+            count = p.get("total_models", len(p.get("models", [])))
+            label = f"{p['name']} ({count} model{'s' if count != 1 else ''})"
+            if p.get("is_current"):
+                label += "  ← current"
+            choices.append(label)
+
+        default_idx = next(
+            (i for i, p in enumerate(providers) if p.get("is_current")), 0
+        )
+
+        idx = self._run_curses_picker(
+            f"Select a provider (current: {current_model} on {current_provider}):",
+            choices,
+            default_index=default_idx,
+        )
+        if idx is None:
+            return None
+        return providers[idx]["slug"]
+
+    def _interactive_model_selection(
+        self, model_list: list, provider_data: dict
+    ) -> str | None:
+        """Show model picker for a given provider, return model_id or None on cancel."""
+        pname = provider_data.get("name", provider_data.get("slug", ""))
+        total = provider_data.get("total_models", len(model_list))
+
+        if not model_list:
+            _cprint(f"\n  No models listed for {pname}.")
+            return self._prompt_text_input("  Enter model name manually (or Enter to cancel): ")
+
+        choices = list(model_list) + ["Enter custom model name"]
+        idx = self._run_curses_picker(
+            f"Select model from {pname} ({len(model_list)} of {total}):",
+            choices,
+        )
+        if idx is None:
+            return None
+        if idx < len(model_list):
+            return model_list[idx]
+        return self._prompt_text_input("  Enter model name: ")
+
     def _open_model_picker(self, providers: list, current_model: str, current_provider: str, user_provs=None, custom_provs=None) -> None:
         """Open prompt_toolkit-native /model picker modal."""
         self._capture_modal_input_snapshot()
@@ -4666,10 +4713,10 @@ class HermesCLI:
             user_provs = None
             custom_provs = None
             try:
-                from hermes_cli.config import get_compatible_custom_providers, load_config
+                from hermes_cli.config import load_config
                 cfg = load_config()
                 user_provs = cfg.get("providers")
-                custom_provs = get_compatible_custom_providers(cfg)
+                custom_provs = cfg.get("custom_providers")
             except Exception:
                 pass
 
@@ -5455,6 +5502,8 @@ class HermesCLI:
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "accounting":
+            self._show_accounting(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "debug":
@@ -6474,6 +6523,424 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _resolve_accounting_scope(self, target: str, accounting_db, session_db) -> tuple[str, list[str]]:
+        target = (target or "current").strip()
+        lowered = target.lower()
+        if lowered == "all":
+            return "all", [row["run_id"] for row in accounting_db.list_root_runs()]
+        if target and lowered != "current":
+            return "root run", [target]
+
+        session_id = getattr(self, "session_id", None)
+        session_ids: list[str] = []
+        if session_id:
+            if session_db is not None:
+                session_ids = session_db.get_session_ancestor_ids(session_id)
+            else:
+                session_ids = [session_id]
+        root_runs = accounting_db.list_root_runs(local_session_ids=session_ids) if session_ids else []
+        if not root_runs:
+            agent = getattr(self, "agent", None)
+            root_run_id = getattr(agent, "root_run_id", None)
+            if root_run_id:
+                run = accounting_db.get_agent_run(root_run_id)
+                if run is not None:
+                    root_runs = [run]
+        return "current session", [row["run_id"] for row in root_runs if row.get("run_id")]
+
+    @staticmethod
+    def _accounting_total_tokens(row: dict) -> int:
+        return (
+            int(row.get("input_tokens") or 0)
+            + int(row.get("output_tokens") or 0)
+            + int(row.get("cache_read_tokens") or 0)
+            + int(row.get("cache_write_tokens") or 0)
+            + int(row.get("reasoning_tokens") or 0)
+        )
+
+    @staticmethod
+    def _format_accounting_usage_summary(row: dict) -> str:
+        parts = [
+            f"in {int(row.get('input_tokens') or 0):,}",
+            f"out {int(row.get('output_tokens') or 0):,}",
+        ]
+        if int(row.get("cache_read_tokens") or 0):
+            parts.append(f"cache-read {int(row.get('cache_read_tokens') or 0):,}")
+        if int(row.get("cache_write_tokens") or 0):
+            parts.append(f"cache-write {int(row.get('cache_write_tokens') or 0):,}")
+        if int(row.get("reasoning_tokens") or 0):
+            parts.append(f"reasoning {int(row.get('reasoning_tokens') or 0):,}")
+        parts.append(f"total {HermesCLI._accounting_total_tokens(row):,}")
+        return "  ".join(parts)
+
+    @staticmethod
+    def _aggregate_accounting_breakdown_rows(rows: list[dict]) -> list[dict]:
+        grouped: dict[tuple, dict] = {}
+        for row in rows:
+            key = (
+                row.get("provider"),
+                row.get("base_url"),
+                row.get("model"),
+                row.get("api_mode"),
+            )
+            agg = grouped.setdefault(key, {
+                "provider": row.get("provider"),
+                "base_url": row.get("base_url"),
+                "model": row.get("model"),
+                "api_mode": row.get("api_mode"),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "exact_event_count": 0,
+                "unknown_event_count": 0,
+            })
+            agg["input_tokens"] += int(row.get("input_tokens") or 0)
+            agg["output_tokens"] += int(row.get("output_tokens") or 0)
+            agg["cache_read_tokens"] += int(row.get("cache_read_tokens") or 0)
+            agg["cache_write_tokens"] += int(row.get("cache_write_tokens") or 0)
+            agg["reasoning_tokens"] += int(row.get("reasoning_tokens") or 0)
+            agg["estimated_cost_usd"] += float(row.get("estimated_cost_usd") or 0.0)
+            agg["exact_event_count"] += int(row.get("exact_event_count") or 0)
+            agg["unknown_event_count"] += int(row.get("unknown_event_count") or 0)
+        return sorted(
+            grouped.values(),
+            key=lambda row: (
+                HermesCLI._accounting_total_tokens(row),
+                float(row.get("estimated_cost_usd") or 0.0),
+                int(row.get("exact_event_count") or 0),
+            ),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _prepare_accounting_breakdown_rows(
+        rows: list[dict],
+        *,
+        compact_all_scope: bool,
+        limit: int = 10,
+    ) -> tuple[list[dict], int]:
+        if not compact_all_scope:
+            return rows, 0
+
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                float(row.get("estimated_cost_usd") or 0.0),
+                HermesCLI._accounting_total_tokens(row),
+                int(row.get("exact_event_count") or 0),
+            ),
+            reverse=True,
+        )
+
+        if limit <= 0 or len(rows) <= limit:
+            return rows, 0
+        return rows[:limit], len(rows) - limit
+
+    @staticmethod
+    def _format_accounting_note_prefix(warning_type: str | None) -> str:
+        return "NOTE" if warning_type == "run_active" else "WARNING"
+
+    @staticmethod
+    def _summarize_accounting_warnings(
+        warnings: list[dict],
+        *,
+        compact_all_scope: bool,
+    ) -> list[dict]:
+        if not compact_all_scope or not warnings:
+            return warnings
+
+        summarized: list[dict] = []
+        missing_session_link_count = 0
+        deferred_run_active = None
+        seen = set()
+
+        for warning in warnings:
+            warning_type = warning.get("type")
+            if warning_type == "missing_session_link":
+                missing_session_link_count += 1
+                continue
+            if warning_type == "run_active":
+                deferred_run_active = warning
+                continue
+
+            key = (warning_type, warning.get("message"))
+            if key in seen:
+                continue
+            seen.add(key)
+            summarized.append(warning)
+
+        if missing_session_link_count:
+            noun = "run" if missing_session_link_count == 1 else "runs"
+            summarized.append({
+                "type": "missing_session_link",
+                "message": (
+                    "No matching local session row was found for "
+                    f"{missing_session_link_count} {noun} in this scope."
+                ),
+            })
+
+        if deferred_run_active is not None:
+            summarized.append(deferred_run_active)
+
+        return summarized
+
+    @staticmethod
+    def _format_accounting_timestamp(timestamp_value) -> str:
+        if timestamp_value is None:
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(float(timestamp_value)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "n/a"
+
+    @staticmethod
+    def _format_accounting_cost(amount) -> str:
+        if amount is None:
+            return "n/a"
+        return f"${float(amount):.5f}"
+
+    @staticmethod
+    def _short_run_id(run_id: str | None) -> str:
+        return (run_id or "unknown")[:8]
+
+    def _show_accounting(self, command: str = "/accounting"):
+        """Show accounting for the current session, all runs, or a specific root run."""
+        from hermes_state import AccountingDB, SessionDB
+
+        parts = command.split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else "current"
+
+        created_accounting_db = False
+        accounting_db = getattr(getattr(self, "agent", None), "_accounting_db", None)
+        if accounting_db is None:
+            accounting_db = AccountingDB()
+            created_accounting_db = True
+
+        session_db = getattr(self, "_session_db", None)
+        created_session_db = False
+        if session_db is None:
+            try:
+                session_db = SessionDB()
+                created_session_db = True
+            except Exception:
+                session_db = None
+
+        try:
+            if target == "all":
+                print("⏳ Summarizing all-scope accounting...")
+            scope_label, root_run_ids = self._resolve_accounting_scope(target, accounting_db, session_db)
+            if not root_run_ids:
+                print("(._.) No accounting found for the requested scope.")
+                return
+
+            run_tree = accounting_db.get_task_run_tree(root_run_ids=root_run_ids)
+            if not run_tree:
+                if scope_label == "root run":
+                    print(f"(._.) Root run not found: {target}")
+                else:
+                    print("(._.) No accounting found for the requested scope.")
+                return
+
+            summary = accounting_db.get_task_usage_summary(root_run_ids=root_run_ids)
+            breakdown = sorted(
+                accounting_db.get_task_usage_breakdown(root_run_ids=root_run_ids),
+                key=lambda row: (
+                    self._accounting_total_tokens(row),
+                    float(row.get("estimated_cost_usd") or 0.0),
+                ),
+                reverse=True,
+            )
+            display_breakdown = self._aggregate_accounting_breakdown_rows(breakdown)
+            compact_all_scope = scope_label == "all"
+            display_breakdown, omitted_breakdown_count = self._prepare_accounting_breakdown_rows(
+                display_breakdown,
+                compact_all_scope=compact_all_scope,
+            )
+            session_links = accounting_db.get_task_session_links(root_run_ids=root_run_ids, session_db=session_db)
+            warnings = list(accounting_db.get_task_provenance_warnings(root_run_ids=root_run_ids, session_db=session_db))
+
+            root_runs = [run for run in run_tree if run.get("parent_run_id") is None]
+            active_root_count = sum(1 for run in root_runs if run.get("ended_at") is None)
+            single_root = len(root_runs) == 1
+            if compact_all_scope:
+                if active_root_count > 0:
+                    warnings.append({
+                        "type": "run_active",
+                        "message": "Some root runs are still active; totals may still change.",
+                    })
+            else:
+                if active_root_count == 1:
+                    warnings.append({
+                        "type": "run_active",
+                        "message": "Run is still active; totals may still change.",
+                    })
+                elif active_root_count > 1:
+                    warnings.append({
+                        "type": "run_active",
+                        "message": f"{active_root_count} runs are still active; totals may still change.",
+                    })
+
+            warnings = self._summarize_accounting_warnings(warnings, compact_all_scope=compact_all_scope)
+            root_run = root_runs[0] if single_root else None
+            root_sessions = sorted({
+                link.get("local_session_id")
+                for link in session_links
+                if link.get("local_session_id") and link.get("run_id") in {run.get("run_id") for run in root_runs}
+            })
+            all_sessions = sorted({
+                link.get("local_session_id")
+                for link in session_links
+                if link.get("local_session_id")
+            })
+            child_sessions = sorted({
+                link.get("local_session_id")
+                for link in session_links
+                if link.get("local_session_id") and link.get("run_id") not in {run.get("run_id") for run in root_runs}
+            })
+            started_candidates = [run.get("started_at") for run in root_runs if run.get("started_at") is not None]
+            ended_candidates = [run.get("ended_at") for run in root_runs if run.get("ended_at") is not None]
+
+            def _print_totals(label: str, row: dict) -> None:
+                print(f"  {label:<14} {self._format_accounting_usage_summary(row)}")
+
+            def _run_usage_row(run_id: str) -> dict:
+                rows = [item for item in breakdown if item.get("run_id") == run_id]
+                return {
+                    "input_tokens": sum(int(item.get("input_tokens") or 0) for item in rows),
+                    "output_tokens": sum(int(item.get("output_tokens") or 0) for item in rows),
+                    "cache_read_tokens": sum(int(item.get("cache_read_tokens") or 0) for item in rows),
+                    "cache_write_tokens": sum(int(item.get("cache_write_tokens") or 0) for item in rows),
+                    "reasoning_tokens": sum(int(item.get("reasoning_tokens") or 0) for item in rows),
+                }
+
+            print("Task accounting" if single_root else "Accounting")
+            print(f"Scope: {scope_label}")
+            print(f"Root runs: {summary['root_run_count']}")
+            if single_root and root_run is not None:
+                print(f"Root run: {root_run.get('run_id')}")
+            print(
+                f"Started: {self._format_accounting_timestamp(min(started_candidates) if started_candidates else None)}"
+            )
+            print(
+                "Ended: "
+                + (
+                    self._format_accounting_timestamp(max(ended_candidates) if ended_candidates else None)
+                    if active_root_count == 0
+                    else (
+                        "running"
+                        if active_root_count == len(root_runs)
+                        else ("mixed" if compact_all_scope else "running")
+                    )
+                )
+            )
+            if single_root and root_run is not None:
+                print(f"Session: {root_run.get('local_session_id') or 'n/a'}")
+                print(f"Home: {root_run.get('home_id') or 'n/a'}")
+            else:
+                if compact_all_scope:
+                    print(f"Sessions: {len(all_sessions)} total")
+                else:
+                    print(f"Sessions: {', '.join(root_sessions) if root_sessions else 'n/a'}")
+            print()
+            print("Totals")
+            _print_totals("Root agent only", summary["manager_only"])
+            _print_totals("Subagents only", summary["worker_only"])
+            _print_totals("Whole task" if single_root else "Whole scope", summary["total"])
+            print()
+            print("Usage status")
+            print(f"  Exact events:    {summary['exact_event_count']}")
+            print(f"  Unknown events:  {summary['unknown_event_count']}")
+            print()
+            print("Estimated cost")
+            print(f"  Total: {self._format_accounting_cost(summary['total'].get('estimated_cost_usd'))}")
+            print()
+            print("Breakdown by provider | model | base_url | api_mode")
+            if display_breakdown:
+                for row in display_breakdown:
+                    route_parts = [
+                        row.get("provider") or "unknown",
+                        row.get("model") or "unknown",
+                    ]
+                    if row.get("base_url"):
+                        route_parts.append(row["base_url"])
+                    if row.get("api_mode"):
+                        route_parts.append(f"api_mode={row['api_mode']}")
+                    route = " | ".join(route_parts)
+                    print(f"  {route}")
+                    print(
+                        f"    {self._format_accounting_usage_summary(row)}  "
+                        f"events {int(row.get('exact_event_count') or 0) + int(row.get('unknown_event_count') or 0)}  "
+                        f"exact {int(row.get('exact_event_count') or 0)} unknown {int(row.get('unknown_event_count') or 0)}"
+                    )
+                    print()
+                if omitted_breakdown_count:
+                    noun = "route" if omitted_breakdown_count == 1 else "routes"
+                    print(f"  ... {omitted_breakdown_count} more {noun} omitted from /accounting all")
+                    print()
+            else:
+                print("  none")
+                print()
+
+            if not compact_all_scope:
+                print("Run tree")
+                if run_tree:
+                    for run in run_tree:
+                        role = "root" if run.get("parent_run_id") is None else "child"
+                        row = _run_usage_row(run.get("run_id"))
+                        unknown_count = sum(
+                            int(item.get("unknown_event_count") or 0)
+                            for item in breakdown
+                            if item.get("run_id") == run.get("run_id")
+                        )
+                        status = "exact" if unknown_count == 0 else "mixed"
+                        print(
+                            f"  {role:<8} {self._short_run_id(run.get('run_id'))}  "
+                            f"profile={run.get('profile_name') or run.get('home_id') or 'default'}  "
+                            f"transport={run.get('transport_kind') or 'unknown'}  "
+                            f"launch={run.get('launch_kind') or 'unknown'}  "
+                            f"{self._format_accounting_usage_summary(row)}  {status}"
+                        )
+                else:
+                    print("  none")
+                print()
+
+                print("Session links")
+                if single_root:
+                    print(f"  root run session:   {root_sessions[0] if root_sessions else 'n/a'}")
+                else:
+                    print(f"  root run sessions:  {', '.join(root_sessions) if root_sessions else 'n/a'}")
+                print(f"  child sessions:     {', '.join(child_sessions) if child_sessions else 'none'}")
+                print()
+
+            print("Accounting notes")
+            if compact_all_scope:
+                print("  NOTE: /accounting all shows scope totals and breakdown only; use /accounting <root_run_id> for per-task details.")
+            if warnings:
+                for warning in warnings:
+                    message = warning.get('message', 'unknown warning')
+                    if warning.get("type") == "unknown_usage" and int(summary.get("unknown_event_count") or 0):
+                        unknown_count = int(summary.get("unknown_event_count") or 0)
+                        noun = "event" if unknown_count == 1 else "events"
+                        verb = "is" if unknown_count == 1 else "are"
+                        message = (
+                            f"Unknown/non-exact usage present: {unknown_count} {noun} {verb} non-exact; "
+                            "totals and estimated cost are not exact."
+                        )
+                    prefix = self._format_accounting_note_prefix(warning.get("type"))
+                    print(f"  {prefix}: {message}")
+            else:
+                print("  none")
+        except Exception as e:
+            print(f"  Error generating accounting report: {e}")
+        finally:
+            if created_session_db and session_db is not None:
+                session_db.close()
+            if created_accounting_db and accounting_db is not None:
+                accounting_db.close()
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

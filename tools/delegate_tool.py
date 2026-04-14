@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
-
 # Tools that children must never have access to
 DELEGATE_BLOCKED_TOOLS = frozenset([
     "delegate_task",   # no recursive delegation
@@ -243,7 +242,7 @@ def _build_child_agent(
     model: Optional[str],
     max_iterations: int,
     parent_agent,
-    # Credential overrides from delegation config (provider:model resolution)
+    *,
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
@@ -345,6 +344,9 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    child_home_id = getattr(parent_agent, 'home_id', None)
+    child_profile_name = getattr(parent_agent, 'profile_name', None)
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -367,7 +369,14 @@ def _build_child_agent(
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
         session_db=getattr(parent_agent, '_session_db', None),
+        accounting_db=getattr(parent_agent, '_accounting_db', None),
         parent_session_id=getattr(parent_agent, 'session_id', None),
+        parent_run_id=getattr(parent_agent, 'run_id', None),
+        root_run_id=getattr(parent_agent, 'root_run_id', None),
+        home_id=child_home_id,
+        profile_name=child_profile_name,
+        launch_kind="delegate_task",
+        transport_kind="acp" if effective_acp_command else "direct",
         providers_allowed=parent_agent.providers_allowed,
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,

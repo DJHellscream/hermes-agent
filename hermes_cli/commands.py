@@ -150,6 +150,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),
     CommandDef("usage", "Show token usage and rate limits for the current session", "Info"),
+    CommandDef("accounting", "Show accounting for the current session, all runs, or a specific root run", "Info",
+               cli_only=True, args_hint="[current|all|root_run_id]"),
     CommandDef("insights", "Show usage insights and analytics", "Info",
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
@@ -169,7 +171,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
 
 # ---------------------------------------------------------------------------
-# Derived lookups -- rebuilt once at import time, refreshed by rebuild_lookups()
+# Derived lookups
 # ---------------------------------------------------------------------------
 
 def _build_command_lookup() -> dict[str, CommandDef]:

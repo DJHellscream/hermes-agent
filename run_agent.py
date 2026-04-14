@@ -44,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_state import AccountingDB
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -108,6 +109,15 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, env_var_enabled
 
+
+
+def _infer_accounting_home_id() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = get_active_profile_name() or "default"
+        return name
+    except Exception:
+        return "default"
 
 
 class _SafeWriter:
@@ -596,7 +606,15 @@ class AIAgent:
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        accounting_db=None,
+        run_id: str = None,
         parent_session_id: str = None,
+        parent_run_id: str = None,
+        root_run_id: str = None,
+        home_id: str = None,
+        profile_name: str = None,
+        launch_kind: str = None,
+        transport_kind: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -1117,7 +1135,38 @@ class AIAgent:
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
-        
+
+        self._accounting_db = accounting_db or (AccountingDB() if self.persist_session else None)
+        self.run_id = run_id or uuid.uuid4().hex
+        self.parent_run_id = parent_run_id
+        self.root_run_id = root_run_id or self.run_id
+        self.home_id = home_id or _infer_accounting_home_id()
+        inferred_profile = None if self.home_id in {"default", "custom"} else self.home_id
+        self.profile_name = profile_name if profile_name is not None else inferred_profile
+        self.launch_kind = launch_kind or ("root" if self.parent_run_id is None else "delegate_task")
+        self.transport_kind = transport_kind or ("acp" if (self.acp_command or command) else "direct")
+        self._has_started_root_task_run = False
+        self._current_assistant_telemetry = None
+        self._accounting_run_closed = False
+        try:
+            if self.persist_session and self._accounting_db is not None:
+                self._accounting_db.create_agent_run(
+                    run_id=self.run_id,
+                    parent_run_id=self.parent_run_id,
+                    root_run_id=self.root_run_id,
+                    local_session_id=self.session_id,
+                    home_id=self.home_id,
+                    profile_name=self.profile_name,
+                    launch_kind=self.launch_kind,
+                    transport_kind=self.transport_kind,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model_hint=self.model,
+                    provider_hint=self.provider,
+                    base_url_hint=self.base_url,
+                )
+        except Exception:
+            logger.debug("Could not create accounting run", exc_info=True)
+
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
@@ -2341,6 +2390,19 @@ class AIAgent:
                     reasoning=msg.get("reasoning") if role == "assistant" else None,
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    run_id=msg.get("run_id") if role == "assistant" else None,
+                    root_run_id=msg.get("root_run_id") if role == "assistant" else None,
+                    provider=msg.get("provider") if role == "assistant" else None,
+                    base_url=msg.get("base_url") if role == "assistant" else None,
+                    model=msg.get("model") if role == "assistant" else None,
+                    api_mode=msg.get("api_mode") if role == "assistant" else None,
+                    input_tokens=msg.get("input_tokens", 0) if role == "assistant" else 0,
+                    output_tokens=msg.get("output_tokens", 0) if role == "assistant" else 0,
+                    cache_read_tokens=msg.get("cache_read_tokens", 0) if role == "assistant" else 0,
+                    cache_write_tokens=msg.get("cache_write_tokens", 0) if role == "assistant" else 0,
+                    reasoning_tokens=msg.get("reasoning_tokens", 0) if role == "assistant" else 0,
+                    estimated_cost_usd=msg.get("estimated_cost_usd") if role == "assistant" else None,
+                    usage_status=msg.get("usage_status") if role == "assistant" else None,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -2987,6 +3049,21 @@ class AIAgent:
             "budget_max": self.iteration_budget.max_total,
         }
 
+    def _end_current_accounting_run(self) -> None:
+        if getattr(self, "_accounting_run_closed", False):
+            return
+        accounting_db = getattr(self, "_accounting_db", None)
+        run_id = getattr(self, "run_id", None)
+        if accounting_db is None or not run_id:
+            self._accounting_run_closed = True
+            return
+        try:
+            accounting_db.end_agent_run(run_id)
+        except Exception:
+            logger.debug("Could not end accounting run", exc_info=True)
+        else:
+            self._accounting_run_closed = True
+
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
 
@@ -2995,6 +3072,7 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        self._end_current_accounting_run()
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -3027,6 +3105,7 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
+        self._end_current_accounting_run()
         task_id = getattr(self, "session_id", None) or ""
 
         # 1. Kill background processes for this task
@@ -6474,6 +6553,9 @@ class AIAgent:
             "reasoning": reasoning_text,
             "finish_reason": finish_reason,
         }
+        telemetry = getattr(self, "_current_assistant_telemetry", None)
+        if telemetry:
+            msg.update(telemetry)
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
@@ -6804,6 +6886,24 @@ class AIAgent:
                     model=self.model,
                     parent_session_id=old_session_id,
                 )
+                try:
+                    if self.persist_session and self._accounting_db is not None:
+                        self._accounting_db.create_agent_run(
+                            run_id=self.run_id,
+                            parent_run_id=self.parent_run_id,
+                            root_run_id=self.root_run_id,
+                            local_session_id=self.session_id,
+                            home_id=self.home_id,
+                            profile_name=self.profile_name,
+                            launch_kind=self.launch_kind,
+                            transport_kind=self.transport_kind,
+                            source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            model_hint=self.model,
+                            provider_hint=self.provider,
+                            base_url_hint=self.base_url,
+                        )
+                except Exception:
+                    logger.debug("Could not refresh accounting run after compression", exc_info=True)
                 # Auto-number the title for the continuation session
                 if old_title:
                     try:
@@ -7742,6 +7842,18 @@ class AIAgent:
 
         return final_response
 
+    def _begin_new_root_task_run_if_needed(self) -> None:
+        """Rotate run lineage for each new top-level turn in long-lived sessions."""
+        if self.parent_run_id is not None or self.launch_kind != "root":
+            return
+        if not self._has_started_root_task_run:
+            self._has_started_root_task_run = True
+            return
+        self._end_current_accounting_run()
+        self.run_id = uuid.uuid4().hex
+        self.root_run_id = self.run_id
+        self._accounting_run_closed = False
+
     def run_conversation(
         self,
         user_message: str,
@@ -7783,8 +7895,29 @@ class AIAgent:
         # runtime so this turn gets a fresh attempt with the preferred model.
         # No-op when _fallback_activated is False (gateway, first turn, etc.).
         self._restore_primary_runtime()
+        self._begin_new_root_task_run_if_needed()
+        self._current_assistant_telemetry = None
 
-        # Sanitize surrogate characters from user input.  Clipboard paste from
+        try:
+            if self.persist_session and self._accounting_db is not None:
+                self._accounting_db.create_agent_run(
+                    run_id=self.run_id,
+                    parent_run_id=self.parent_run_id,
+                    root_run_id=self.root_run_id,
+                    local_session_id=self.session_id,
+                    home_id=self.home_id,
+                    profile_name=self.profile_name,
+                    launch_kind=self.launch_kind,
+                    transport_kind=self.transport_kind,
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                    model_hint=self.model,
+                    provider_hint=self.provider,
+                    base_url_hint=self.base_url,
+                )
+        except Exception:
+            logger.debug("Could not refresh accounting run", exc_info=True)
+
+        # Sanitize surrogate characters from user input. Clipboard paste from
         # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
         # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
         if isinstance(user_message, str):
@@ -8819,17 +8952,37 @@ class AIAgent:
                             api_duration, _cache_pct,
                         )
 
+                        actual_provider = getattr(response, "hermes_provider", None) or self.provider
+                        actual_base_url = getattr(response, "hermes_base_url", None) or self.base_url
+                        actual_api_mode = getattr(response, "hermes_api_mode", None) or self.api_mode
+
                         cost_result = estimate_usage_cost(
                             self.model,
                             canonical_usage,
-                            provider=self.provider,
-                            base_url=self.base_url,
+                            provider=actual_provider,
+                            base_url=actual_base_url,
                             api_key=getattr(self, "api_key", ""),
                         )
                         if cost_result.amount_usd is not None:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+                        self._current_assistant_telemetry = {
+                            "run_id": self.run_id,
+                            "root_run_id": self.root_run_id,
+                            "provider": actual_provider,
+                            "base_url": actual_base_url,
+                            "model": self.model,
+                            "api_mode": actual_api_mode,
+                            "input_tokens": canonical_usage.input_tokens,
+                            "output_tokens": canonical_usage.output_tokens,
+                            "cache_read_tokens": canonical_usage.cache_read_tokens,
+                            "cache_write_tokens": canonical_usage.cache_write_tokens,
+                            "reasoning_tokens": canonical_usage.reasoning_tokens,
+                            "estimated_cost_usd": float(cost_result.amount_usd)
+                            if cost_result.amount_usd is not None else None,
+                            "usage_status": "exact",
+                        }
 
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI
@@ -8838,7 +8991,7 @@ class AIAgent:
                         # is skipped or fails. Gateway/session-store writes use
                         # absolute totals, so they safely overwrite these per-call
                         # deltas instead of double-counting them.
-                        if self._session_db and self.session_id:
+                        if self.persist_session and self._session_db and self.session_id:
                             try:
                                 self._session_db.update_token_counts(
                                     self.session_id,
@@ -8851,18 +9004,60 @@ class AIAgent:
                                     if cost_result.amount_usd is not None else None,
                                     cost_status=cost_result.status,
                                     cost_source=cost_result.source,
-                                    billing_provider=self.provider,
-                                    billing_base_url=self.base_url,
-                                    billing_mode="subscription_included"
-                                    if cost_result.status == "included" else None,
+                                    billing_provider=actual_provider,
+                                    billing_base_url=actual_base_url,
+                                    billing_mode=actual_api_mode,
                                     model=self.model,
                                 )
                             except Exception:
                                 pass  # never block the agent loop
-                        
+
+                        try:
+                            if self.persist_session and self._accounting_db is not None:
+                                self._accounting_db.create_agent_run(
+                                    run_id=self.run_id,
+                                    parent_run_id=self.parent_run_id,
+                                    root_run_id=self.root_run_id,
+                                    local_session_id=self.session_id,
+                                    home_id=self.home_id,
+                                    profile_name=self.profile_name,
+                                    launch_kind=self.launch_kind,
+                                    transport_kind=self.transport_kind,
+                                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                                    model_hint=self.model,
+                                    provider_hint=actual_provider,
+                                    base_url_hint=actual_base_url,
+                                )
+                        except Exception:
+                            pass  # never block the agent loop
+
+                        try:
+                            if self.persist_session and self._accounting_db is not None:
+                                self._accounting_db.append_usage_event(
+                                    run_id=self.run_id,
+                                    root_run_id=self.root_run_id,
+                                    home_id=self.home_id,
+                                    profile_name=self.profile_name,
+                                    local_session_id=self.session_id,
+                                    provider=actual_provider,
+                                    base_url=actual_base_url,
+                                    model=self.model,
+                                    api_mode=actual_api_mode,
+                                    input_tokens=canonical_usage.input_tokens,
+                                    output_tokens=canonical_usage.output_tokens,
+                                    cache_read_tokens=canonical_usage.cache_read_tokens,
+                                    cache_write_tokens=canonical_usage.cache_write_tokens,
+                                    reasoning_tokens=canonical_usage.reasoning_tokens,
+                                    estimated_cost_usd=float(cost_result.amount_usd)
+                                    if cost_result.amount_usd is not None else None,
+                                    usage_status="exact",
+                                )
+                        except Exception:
+                            pass  # never block the agent loop
+
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
-                        
+
                         # Log cache hit stats when prompt caching is active
                         if self._use_prompt_caching:
                             if self.api_mode == "anthropic_messages":
@@ -8878,6 +9073,65 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                    else:
+                        actual_provider = getattr(response, "hermes_provider", None) or self.provider
+                        actual_base_url = getattr(response, "hermes_base_url", None) or self.base_url
+                        actual_api_mode = getattr(response, "hermes_api_mode", None) or self.api_mode
+                        self._current_assistant_telemetry = {
+                            "run_id": self.run_id,
+                            "root_run_id": self.root_run_id,
+                            "provider": actual_provider,
+                            "base_url": actual_base_url,
+                            "model": self.model,
+                            "api_mode": actual_api_mode,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "estimated_cost_usd": None,
+                            "usage_status": "unknown",
+                        }
+                        try:
+                            if self.persist_session and self._accounting_db is not None:
+                                self._accounting_db.create_agent_run(
+                                    run_id=self.run_id,
+                                    parent_run_id=self.parent_run_id,
+                                    root_run_id=self.root_run_id,
+                                    local_session_id=self.session_id,
+                                    home_id=self.home_id,
+                                    profile_name=self.profile_name,
+                                    launch_kind=self.launch_kind,
+                                    transport_kind=self.transport_kind,
+                                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                                    model_hint=self.model,
+                                    provider_hint=actual_provider,
+                                    base_url_hint=actual_base_url,
+                                )
+                        except Exception:
+                            pass  # never block the agent loop
+                        try:
+                            if self.persist_session and self._accounting_db is not None:
+                                self._accounting_db.append_usage_event(
+                                    run_id=self.run_id,
+                                    root_run_id=self.root_run_id,
+                                    home_id=self.home_id,
+                                    profile_name=self.profile_name,
+                                    local_session_id=self.session_id,
+                                    provider=actual_provider,
+                                    base_url=actual_base_url,
+                                    model=self.model,
+                                    api_mode=actual_api_mode,
+                                    input_tokens=0,
+                                    output_tokens=0,
+                                    cache_read_tokens=0,
+                                    cache_write_tokens=0,
+                                    reasoning_tokens=0,
+                                    estimated_cost_usd=None,
+                                    usage_status="unknown",
+                                )
+                        except Exception:
+                            pass  # never block the agent loop
                     
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")
@@ -10546,6 +10800,7 @@ class AIAgent:
                 break
 
         # Build result with interrupt info if applicable
+        actual_runtime_meta = getattr(self, "_current_assistant_telemetry", None) or {}
         result = {
             "final_response": final_response,
             "last_reasoning": last_reasoning,
@@ -10558,6 +10813,9 @@ class AIAgent:
             "model": self.model,
             "provider": self.provider,
             "base_url": self.base_url,
+            "actual_provider": actual_runtime_meta.get("provider") or self.provider,
+            "actual_base_url": actual_runtime_meta.get("base_url") or self.base_url,
+            "actual_api_mode": actual_runtime_meta.get("api_mode") or self.api_mode,
             "input_tokens": self.session_input_tokens,
             "output_tokens": self.session_output_tokens,
             "cache_read_tokens": self.session_cache_read_tokens,

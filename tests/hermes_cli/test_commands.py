@@ -103,6 +103,10 @@ class TestResolveCommand:
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
 
+    def test_accounting_command_resolves(self):
+        assert resolve_command("accounting").name == "accounting"
+        assert resolve_command("/accounting").name == "accounting"
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"

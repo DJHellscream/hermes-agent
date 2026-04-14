@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from cli import HermesCLI
+from hermes_state import AccountingDB, SessionDB
 
 
 def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
@@ -323,6 +324,769 @@ class TestCLIUsageReport:
         assert "Total cost:" in output
         assert "n/a" in output
         assert "Pricing unknown for glm-5" in output
+
+
+class TestCLIAccountingReport:
+    def test_show_accounting_reports_current_task_tree(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            session_db.create_session(session_id="session-child", source="cli", parent_session_id="session-root")
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=1_700_000_000.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="child-run",
+                root_run_id="root-run",
+                parent_run_id="root-run",
+                local_session_id="session-child",
+                home_id="worker",
+                profile_name="superbif-stateless",
+                launch_kind="delegate_task",
+                transport_kind="acp",
+                started_at=1_700_000_010.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=100,
+                output_tokens=10,
+                estimated_cost_usd=0.001,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="child-run",
+                root_run_id="root-run",
+                local_session_id="session-child",
+                home_id="worker",
+                profile_name="superbif-stateless",
+                provider="custom",
+                base_url="http://superbif:8000/v1",
+                model="google/gemma-4-26B-A4B-it",
+                input_tokens=40,
+                output_tokens=4,
+                cache_write_tokens=3,
+                reasoning_tokens=2,
+                estimated_cost_usd=0.002,
+                usage_status="exact",
+            )
+
+            cli_obj._session_db = session_db
+            cli_obj.agent = SimpleNamespace(root_run_id="root-run", run_id="root-run", _accounting_db=accounting_db)
+
+            cli_obj._show_accounting()
+            output = capsys.readouterr().out
+
+            assert "Task accounting" in output
+            assert "Root run: root-run" in output
+            assert "Root agent only" in output
+            assert "Subagents only" in output
+            assert "Whole task" in output
+            assert "Breakdown by provider | model | base_url | api_mode" in output
+            assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
+            assert "custom | google/gemma-4-26B-A4B-it | http://superbif:8000/v1" in output
+            assert "cache-write 3" in output
+            assert "reasoning 2" in output
+            assert "Run tree" in output
+            assert "root     root-run" in output
+            assert "child    child-ru" in output
+            assert "profile=superbif-stateless" in output
+            assert "transport=acp" in output
+            assert "launch=delegate_task" in output
+            assert "Session links" in output
+            assert "Accounting notes" in output
+            assert "NOTE: Run is still active; totals may still change." in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_breakdown_labels_include_api_mode(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=1_700_000_000.0,
+            )
+            for api_mode, input_tokens, output_tokens in (
+                ("responses", 100, 10),
+                ("chat_completions", 40, 4),
+            ):
+                accounting_db.append_usage_event(
+                    run_id="root-run",
+                    root_run_id="root-run",
+                    local_session_id="session-root",
+                    home_id="default",
+                    provider="openai",
+                    base_url="https://api.openai.com/v1",
+                    model="gpt-5.4",
+                    api_mode=api_mode,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            cli_obj.agent = SimpleNamespace(root_run_id="root-run", run_id="root-run", _accounting_db=accounting_db)
+
+            cli_obj._show_accounting()
+            output = capsys.readouterr().out
+
+            assert "Breakdown by provider | model | base_url | api_mode" in output
+            assert "openai | gpt-5.4 | https://api.openai.com/v1 | api_mode=responses" in output
+            assert "openai | gpt-5.4 | https://api.openai.com/v1 | api_mode=chat_completions" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_current_aggregates_all_roots_for_session(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            accounting_db.create_agent_run(
+                run_id="older-root",
+                root_run_id="older-root",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="newer-root",
+                root_run_id="newer-root",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="older-root",
+                root_run_id="older-root",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=5,
+                output_tokens=1,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="newer-root",
+                root_run_id="newer-root",
+                local_session_id="session-root",
+                home_id="default",
+                provider="custom",
+                base_url="http://superbif:8000/v1",
+                model="google/gemma-4-26B-A4B-it",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting current")
+            output = capsys.readouterr().out
+
+            assert "Scope: current session" in output
+            assert "Root runs: 2" in output
+            assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
+            assert "custom | google/gemma-4-26B-A4B-it | http://superbif:8000/v1" in output
+            assert "in 12  out 3  total 15" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_breakdown_aggregates_same_route_across_runs(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            for run_id, started_at, input_tokens, output_tokens in (
+                ("older-root", 100.0, 5, 1),
+                ("newer-root", 200.0, 7, 2),
+            ):
+                accounting_db.create_agent_run(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id="session-root",
+                    home_id="default",
+                    launch_kind="root",
+                    transport_kind="direct",
+                    started_at=started_at,
+                )
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id="session-root",
+                    home_id="default",
+                    provider="openai-codex",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    model="gpt-5.4",
+                    api_mode="codex_responses",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting current")
+            output = capsys.readouterr().out
+
+            route = "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex | api_mode=codex_responses"
+            assert output.count(route) == 1
+            assert "in 12  out 3  total 15  events 2  exact 2 unknown 0" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_aggregates_every_root_run(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            session_db.create_session(session_id="other-session", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="other-session",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=5,
+                output_tokens=1,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="other-session",
+                home_id="default",
+                provider="custom",
+                base_url="http://worker/v1",
+                model="local-model",
+                input_tokens=7,
+                output_tokens=2,
+                usage_status="exact",
+            )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "Scope: all" in output
+            assert "Root runs: 2" in output
+            assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
+            assert "custom | local-model | http://worker/v1" in output
+            assert "in 12  out 3  total 15" in output
+            assert "Run tree" not in output
+            assert "Session links" not in output
+            assert "/accounting <root_run_id> for per-task details" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_summarizes_repeated_provenance_warnings(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            for run_id, session_id, started_at in (
+                ("root-a", "missing-a", 100.0),
+                ("root-b", "missing-b", 200.0),
+                ("root-c", "missing-c", 300.0),
+            ):
+                accounting_db.create_agent_run(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    launch_kind="root",
+                    transport_kind="direct",
+                    started_at=started_at,
+                )
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    provider="openai-codex",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    model="gpt-5.4",
+                    input_tokens=5,
+                    output_tokens=1,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert output.count("No matching local session row was found") == 1
+            assert "No matching local session row was found for 3 runs in this scope." in output
+            assert "Run tree" not in output
+            assert "Session links" not in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_uses_compact_scope_metadata(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            session_db.create_session(session_id="other-session", source="cli")
+            for run_id, session_id, started_at in (
+                ("root-a", "session-root", 100.0),
+                ("root-b", "other-session", 200.0),
+            ):
+                accounting_db.create_agent_run(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    launch_kind="root",
+                    transport_kind="direct",
+                    started_at=started_at,
+                )
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    provider="openai-codex",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    model="gpt-5.4",
+                    input_tokens=5,
+                    output_tokens=1,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "⏳ Summarizing all-scope accounting..." in output
+            assert "Sessions: 2 total" in output
+            assert "Sessions: other-session, session-root" not in output
+            assert "Ended: running" in output
+            assert "NOTE: Some root runs are still active; totals may still change." in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_reports_mixed_lifecycle_when_some_roots_ended(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            session_db.create_session(session_id="other-session", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="other-session",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.end_agent_run("root-a")
+            for run_id, session_id in (("root-a", "session-root"), ("root-b", "other-session")):
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    provider="openai-codex",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    model="gpt-5.4",
+                    input_tokens=5,
+                    output_tokens=1,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "Ended: mixed" in output
+            assert "NOTE: Some root runs are still active; totals may still change." in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_limits_breakdown_rows(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            for idx in range(12):
+                session_id = f"session-{idx}"
+                session_db.create_session(session_id=session_id, source="cli")
+                run_id = f"root-{idx}"
+                accounting_db.create_agent_run(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    launch_kind="root",
+                    transport_kind="direct",
+                    started_at=100.0 + idx,
+                )
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    provider=f"provider-{idx}",
+                    base_url=f"http://route-{idx}.example/v1",
+                    model=f"model-{idx}",
+                    api_mode="chat_completions",
+                    input_tokens=100 - idx,
+                    output_tokens=1,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "provider-0 | model-0 | http://route-0.example/v1 | api_mode=chat_completions" in output
+            assert "provider-9 | model-9 | http://route-9.example/v1 | api_mode=chat_completions" in output
+            assert "provider-10 | model-10 | http://route-10.example/v1 | api_mode=chat_completions" not in output
+            assert "provider-11 | model-11 | http://route-11.example/v1 | api_mode=chat_completions" not in output
+            assert "2 more routes omitted from /accounting all" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_keeps_high_cost_routes_visible(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            for idx in range(10):
+                session_id = f"cheap-session-{idx}"
+                session_db.create_session(session_id=session_id, source="cli")
+                run_id = f"cheap-root-{idx}"
+                accounting_db.create_agent_run(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    launch_kind="root",
+                    transport_kind="direct",
+                    started_at=100.0 + idx,
+                )
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    provider=f"cheap-provider-{idx}",
+                    base_url=f"http://cheap-{idx}.example/v1",
+                    model=f"cheap-model-{idx}",
+                    api_mode="chat_completions",
+                    input_tokens=1000 - idx,
+                    output_tokens=1,
+                    estimated_cost_usd=0.001,
+                    usage_status="exact",
+                )
+
+            session_db.create_session(session_id="expensive-session", source="cli")
+            accounting_db.create_agent_run(
+                run_id="expensive-root",
+                root_run_id="expensive-root",
+                local_session_id="expensive-session",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=500.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="expensive-root",
+                root_run_id="expensive-root",
+                local_session_id="expensive-session",
+                home_id="default",
+                provider="expensive-provider",
+                base_url="http://expensive.example/v1",
+                model="expensive-model",
+                api_mode="chat_completions",
+                input_tokens=5,
+                output_tokens=1,
+                estimated_cost_usd=5.0,
+                usage_status="exact",
+            )
+
+            session_db.create_session(session_id="omitted-session", source="cli")
+            accounting_db.create_agent_run(
+                run_id="omitted-root",
+                root_run_id="omitted-root",
+                local_session_id="omitted-session",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=600.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="omitted-root",
+                root_run_id="omitted-root",
+                local_session_id="omitted-session",
+                home_id="default",
+                provider="omitted-provider",
+                base_url="http://omitted.example/v1",
+                model="omitted-model",
+                api_mode="chat_completions",
+                input_tokens=900,
+                output_tokens=1,
+                estimated_cost_usd=0.0001,
+                usage_status="exact",
+            )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "expensive-provider | expensive-model | http://expensive.example/v1 | api_mode=chat_completions" in output
+            assert "omitted-provider | omitted-model | http://omitted.example/v1 | api_mode=chat_completions" not in output
+            assert "2 more routes omitted from /accounting all" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_all_counts_all_distinct_sessions_in_scope(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root-a"
+        cli_obj.agent = None
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            for session_id, parent in (
+                ("session-root-a", None),
+                ("session-root-b", None),
+                ("session-child-a", "session-root-a"),
+                ("session-child-b", "session-root-b"),
+            ):
+                session_db.create_session(session_id=session_id, source="cli", parent_session_id=parent)
+
+            accounting_db.create_agent_run(
+                run_id="root-a",
+                root_run_id="root-a",
+                local_session_id="session-root-a",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=100.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="child-a",
+                root_run_id="root-a",
+                parent_run_id="root-a",
+                local_session_id="session-child-a",
+                home_id="worker",
+                profile_name="worker-a",
+                launch_kind="delegate_task",
+                transport_kind="acp",
+                started_at=110.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="root-b",
+                root_run_id="root-b",
+                local_session_id="session-root-b",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=200.0,
+            )
+            accounting_db.create_agent_run(
+                run_id="child-b",
+                root_run_id="root-b",
+                parent_run_id="root-b",
+                local_session_id="session-child-b",
+                home_id="worker",
+                profile_name="worker-b",
+                launch_kind="delegate_task",
+                transport_kind="acp",
+                started_at=210.0,
+            )
+            for run_id, root_run_id, session_id in (
+                ("root-a", "root-a", "session-root-a"),
+                ("child-a", "root-a", "session-child-a"),
+                ("root-b", "root-b", "session-root-b"),
+                ("child-b", "root-b", "session-child-b"),
+            ):
+                accounting_db.append_usage_event(
+                    run_id=run_id,
+                    root_run_id=root_run_id,
+                    local_session_id=session_id,
+                    home_id="default",
+                    provider="openai-codex",
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    model="gpt-5.4",
+                    input_tokens=5,
+                    output_tokens=1,
+                    usage_status="exact",
+                )
+
+            cli_obj._session_db = session_db
+            with patch("hermes_state.AccountingDB", return_value=accounting_db):
+                cli_obj._show_accounting("/accounting all")
+            output = capsys.readouterr().out
+
+            assert "Sessions: 4 total" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
+
+    def test_show_accounting_warns_when_usage_is_non_exact(self, tmp_path, capsys):
+        cli_obj = _make_cli()
+        cli_obj.session_id = "session-root"
+
+        accounting_db = AccountingDB(db_path=tmp_path / "accounting.db")
+        session_db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            session_db.create_session(session_id="session-root", source="cli")
+            accounting_db.create_agent_run(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                launch_kind="root",
+                transport_kind="direct",
+                started_at=1_700_000_000.0,
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=100,
+                output_tokens=10,
+                estimated_cost_usd=0.001,
+                usage_status="exact",
+            )
+            accounting_db.append_usage_event(
+                run_id="root-run",
+                root_run_id="root-run",
+                local_session_id="session-root",
+                home_id="default",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                model="gpt-5.4",
+                input_tokens=25,
+                output_tokens=5,
+                estimated_cost_usd=0.0002,
+                usage_status="unknown",
+            )
+
+            cli_obj._session_db = session_db
+            cli_obj.agent = SimpleNamespace(root_run_id="root-run", run_id="root-run", _accounting_db=accounting_db)
+
+            cli_obj._show_accounting()
+            output = capsys.readouterr().out
+
+            assert "Unknown events:  1" in output
+            assert "WARNING: Unknown/non-exact usage present" in output
+            assert "totals and estimated cost are not exact" in output
+        finally:
+            session_db.close()
+            accounting_db.close()
 
 
 class TestStatusBarWidthSource:

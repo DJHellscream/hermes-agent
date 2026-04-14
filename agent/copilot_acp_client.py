@@ -313,19 +313,27 @@ class CopilotACPClient:
             tools=tools,
             tool_choice=tool_choice,
         )
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, usage_data, runtime_meta = self._run_prompt(
             prompt_text,
             timeout_seconds=float(timeout or _DEFAULT_TIMEOUT_SECONDS),
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = None
+        if usage_data and isinstance(usage_data, dict):
+            prompt_tokens = usage_data.get("prompt_tokens", usage_data.get("input_tokens", usage_data.get("inputTokens", 0)))
+            completion_tokens = usage_data.get("completion_tokens", usage_data.get("output_tokens", usage_data.get("outputTokens", 0)))
+            total_tokens = usage_data.get("total_tokens", usage_data.get("totalTokens", 0))
+            cached_tokens = usage_data.get("cached_tokens", usage_data.get("cache_read_tokens", usage_data.get("cachedReadTokens", 0))) or 0
+            reasoning_tokens = usage_data.get("reasoning_tokens", usage_data.get("thoughtTokens", 0)) or 0
+            usage = SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+                reasoning_tokens=reasoning_tokens,
+            )
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -339,9 +347,17 @@ class CopilotACPClient:
             choices=[choice],
             usage=usage,
             model=model or "copilot-acp",
+            hermes_provider=(runtime_meta or {}).get("provider"),
+            hermes_base_url=(runtime_meta or {}).get("base_url"),
+            hermes_api_mode=(runtime_meta or {}).get("api_mode"),
         )
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[str, str, dict[str, Any] | None, dict[str, Any] | None]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -465,7 +481,7 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            _request(
+            prompt_result = _request(
                 "session/prompt",
                 {
                     "sessionId": session_id,
@@ -478,8 +494,20 @@ class CopilotACPClient:
                 },
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
-            )
-            return "".join(text_parts), "".join(reasoning_parts)
+            ) or {}
+            usage_data = prompt_result.get("usage") if isinstance(prompt_result, dict) else None
+            runtime_meta = None
+            if isinstance(prompt_result, dict):
+                raw_meta = prompt_result.get("_meta") or prompt_result.get("meta")
+                if isinstance(raw_meta, dict):
+                    candidate = raw_meta.get("hermesRuntime")
+                    if isinstance(candidate, dict):
+                        runtime_meta = {
+                            "provider": candidate.get("provider"),
+                            "base_url": candidate.get("base_url"),
+                            "api_mode": candidate.get("api_mode"),
+                        }
+            return "".join(text_parts), "".join(reasoning_parts), usage_data, runtime_meta
         finally:
             self.close()
 

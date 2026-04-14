@@ -92,6 +92,13 @@ class TestSlashCommandPrefixMatching:
             cli_obj.process_command("/help")
         mock_help.assert_called_once()
 
+    def test_accounting_command_dispatches(self):
+        """/accounting current should route to the dedicated handler."""
+        cli_obj = _make_cli()
+        with patch.object(cli_obj, '_show_accounting') as mock_accounting:
+            cli_obj.process_command("/accounting current")
+        mock_accounting.assert_called_once_with("/accounting current")
+
     def test_skill_command_prefix_matches(self):
         """A prefix that uniquely matches a skill command should dispatch it."""
         cli_obj = _make_cli()
