@@ -456,6 +456,7 @@ def run_import(args) -> None:
 # (skills, repo, sessions/).
 _QUICK_STATE_FILES = (
     "state.db",
+    "accounting.db",
     "config.yaml",
     ".env",
     "auth.json",

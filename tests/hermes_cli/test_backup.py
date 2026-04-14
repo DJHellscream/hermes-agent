@@ -21,6 +21,7 @@ def _make_hermes_tree(root: Path) -> None:
     (root / ".env").write_text("OPENROUTER_API_KEY=sk-test-123\n")
     (root / "memory_store.db").write_bytes(b"fake-sqlite")
     (root / "hermes_state.db").write_bytes(b"fake-state")
+    (root / "accounting.db").write_bytes(b"fake-accounting")
 
     # Sessions
     (root / "sessions").mkdir(exist_ok=True)
@@ -143,6 +144,8 @@ class TestBackup:
             # Config should be present
             assert "config.yaml" in names
             assert ".env" in names
+            # Databases
+            assert "accounting.db" in names
             # Skills
             assert "skills/my-skill/SKILL.md" in names
             # Profiles
@@ -998,11 +1001,18 @@ class TestQuickSnapshot:
         (home / "cron").mkdir()
         (home / "cron" / "jobs.json").write_text('{"jobs": []}\n')
 
-        # Real SQLite database
+        # Real SQLite databases
         db_path = home / "state.db"
         conn = sqlite3.connect(str(db_path))
         conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT)")
         conn.execute("INSERT INTO sessions VALUES ('s1', 'hello world')")
+        conn.commit()
+        conn.close()
+
+        accounting_db_path = home / "accounting.db"
+        conn = sqlite3.connect(str(accounting_db_path))
+        conn.execute("CREATE TABLE usage_events (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO usage_events (value) VALUES ('usage row')")
         conn.commit()
         conn.close()
         return home
@@ -1031,6 +1041,17 @@ class TestQuickSnapshot:
         conn.close()
         assert len(rows) == 1
         assert rows[0] == ("s1", "hello world")
+
+    def test_accounting_db_safely_copied(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        db_copy = hermes_home / "state-snapshots" / snap_id / "accounting.db"
+        assert db_copy.exists()
+
+        conn = sqlite3.connect(str(db_copy))
+        rows = conn.execute("SELECT value FROM usage_events").fetchall()
+        conn.close()
+        assert rows == [("usage row",)]
 
     def test_copies_nested_files(self, hermes_home):
         from hermes_cli.backup import create_quick_snapshot
@@ -1094,6 +1115,22 @@ class TestQuickSnapshot:
         rows = conn.execute("SELECT * FROM sessions").fetchall()
         conn.close()
         assert len(rows) == 1
+
+    def test_restore_accounting_db(self, hermes_home):
+        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+
+        conn = sqlite3.connect(str(hermes_home / "accounting.db"))
+        conn.execute("INSERT INTO usage_events (value) VALUES ('new row')")
+        conn.commit()
+        conn.close()
+
+        restore_quick_snapshot(snap_id, hermes_home=hermes_home)
+
+        conn = sqlite3.connect(str(hermes_home / "accounting.db"))
+        rows = conn.execute("SELECT value FROM usage_events").fetchall()
+        conn.close()
+        assert rows == [("usage row",)]
 
     def test_restore_nonexistent(self, hermes_home):
         from hermes_cli.backup import restore_quick_snapshot
