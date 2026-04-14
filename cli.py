@@ -6767,11 +6767,7 @@ class HermesCLI:
             active_root_count = sum(1 for run in root_runs if run.get("ended_at") is None)
             single_root = len(root_runs) == 1
             if compact_all_scope:
-                if active_root_count > 0:
-                    warnings.append({
-                        "type": "run_active",
-                        "message": "Some root runs are still active; totals may still change.",
-                    })
+                pass
             else:
                 if active_root_count == 1:
                     warnings.append({

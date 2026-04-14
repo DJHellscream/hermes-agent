@@ -740,7 +740,7 @@ class TestCLIAccountingReport:
             assert "Sessions: 2 total" in output
             assert "Sessions: other-session, session-root" not in output
             assert "Ended: running" in output
-            assert "NOTE: Some root runs are still active; totals may still change." in output
+            assert "NOTE: Some root runs are still active; totals may still change." not in output
         finally:
             session_db.close()
             accounting_db.close()
@@ -794,7 +794,7 @@ class TestCLIAccountingReport:
             output = capsys.readouterr().out
 
             assert "Ended: mixed" in output
-            assert "NOTE: Some root runs are still active; totals may still change." in output
+            assert "NOTE: Some root runs are still active; totals may still change." not in output
         finally:
             session_db.close()
             accounting_db.close()
