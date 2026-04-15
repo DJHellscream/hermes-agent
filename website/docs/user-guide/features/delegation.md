@@ -88,6 +88,10 @@ toolsets=["terminal", "file"]
 
 then the delegated worker is constrained to that capability boundary even if the selected profile would normally have broader tools available.
 
+:::note Hermes workers vs generic ACP subprocesses
+For profile-backed Hermes workers, that toolset boundary is enforced on the worker side as well as the parent side. For arbitrary ACP subprocesses launched via `acp_command` / `acp_args`, Hermes still constrains the tool schema it hands to the subprocess, but the subprocess may expose additional ACP-native capabilities of its own. Treat generic ACP backends as trusted integrations, not as strict sandboxes.
+:::
+
 ## Single Task
 
 ```python
@@ -201,7 +205,7 @@ delegate_task(
 
 When you provide a `tasks` array, subagents run in **parallel** using a thread pool:
 
-- **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
+- **Maximum concurrency:** configurable via `delegation.max_concurrent_children` (default: 3; env override `DELEGATION_MAX_CONCURRENT_CHILDREN`; floor of 1, no hard ceiling). If you provide more tasks than the limit, Hermes returns a clear error instead of truncating the batch.
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
 - **Progress display:** In CLI mode, a tree-view shows tool calls from each subagent in real-time with per-task completion lines. In gateway mode, progress is batched and relayed to the parent's progress callback
 - **Result ordering:** Results are sorted by task index to match input order regardless of completion order
@@ -295,7 +299,7 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `execute_code`. Orchestrator subagents retain `delegate_task` but still cannot use the other four.
 - **Interrupt propagation** — interrupting the parent interrupts all active children (including grandchildren under orchestrators)
 - Only the final summary enters the parent's context, keeping token usage efficient
-- Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
+- Profile-backed Hermes workers use the selected profile's runtime/home/auth. Generic subagents without `profile` continue to inherit the parent's runtime family, and generic ACP subprocesses use the explicitly provided `acp_command` / `acp_args`.
 
 ## Delegation vs execute_code
 

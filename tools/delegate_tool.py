@@ -887,10 +887,6 @@ def _resolve_profile_runtime(profile_name: str) -> dict:
             "profile_name": profile_name,
             "home_id": profile_name,
             "model": str(model_cfg.get("default") or "").strip() or None,
-            "provider": str(model_cfg.get("provider") or "").strip() or None,
-            "base_url": str(model_cfg.get("base_url") or "").strip() or None,
-            "api_key": str(model_cfg.get("api_key") or "").strip() or None,
-            "api_mode": str(model_cfg.get("api_mode") or "").strip() or None,
         }
     except Exception:
         logger.debug("Could not resolve profile runtime for ACP worker", exc_info=True)
@@ -1096,7 +1092,7 @@ def _build_child_agent(
 
     if worker_profile:
         profile_runtime = _resolve_profile_runtime(worker_profile)
-        effective_model = model or profile_runtime.get("model") or effective_model
+        effective_model = profile_runtime.get("model") or effective_model
         child_home_id = profile_runtime.get("home_id") or worker_profile
         child_profile_name = profile_runtime.get("profile_name") or worker_profile
     elif override_provider and not override_acp_command:
@@ -2643,7 +2639,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "Batch mode: tasks to run in parallel (limit configurable via delegation.max_concurrent_children, default 3). Each gets "
                     "its own subagent with isolated context and terminal session. "
-                    "When provided, top-level goal/context/toolsets are ignored."
+                    "Top-level goal/context are ignored in batch mode, while top-level toolsets/profile/acp settings act as defaults for task entries that omit them."
                 ),
             },
             "role": {

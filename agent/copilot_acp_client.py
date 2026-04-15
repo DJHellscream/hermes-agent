@@ -27,6 +27,11 @@ from agent.redact import redact_sensitive_text
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 
+# Historical naming note: Hermes currently reuses the legacy `copilot-acp`
+# provider/base-url markers for any ACP subprocess transport, not only GitHub
+# Copilot. This module therefore acts as the generic ACP subprocess stdio shim
+# even when the spawned command is `hermes` or another ACP-capable tool.
+
 
 def _coerce_timeout_seconds(timeout: Any) -> float:
     if timeout is None:
@@ -523,7 +528,27 @@ class CopilotACPClient:
                     raise RuntimeError(
                         f"Copilot ACP {method} failed: {err.get('message') or err}"
                     )
-                return msg.get("result")
+                result = msg.get("result")
+                if method == "session/prompt" and (text_parts is not None or reasoning_parts is not None):
+                    idle_deadline = time.time() + min(0.5, max(0.2, timeout_seconds * 0.05))
+                    while time.time() < idle_deadline:
+                        try:
+                            trailing = inbox.get(timeout=0.05)
+                        except queue.Empty:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        if self._handle_server_message(
+                            trailing,
+                            process=proc,
+                            cwd=self._acp_cwd,
+                            text_parts=text_parts,
+                            reasoning_parts=reasoning_parts,
+                        ):
+                            idle_deadline = time.time() + 0.1
+                            continue
+                    return result
+                return result
 
             stderr_text = "\n".join(stderr_tail).strip()
             if proc.poll() is not None and stderr_text:

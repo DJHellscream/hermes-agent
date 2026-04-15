@@ -168,11 +168,7 @@ class TestACPWorkerProfileRuntime(unittest.TestCase):
 
             self.assertEqual(resolved["home_id"], "coder")
             self.assertEqual(resolved["profile_name"], "coder")
-            self.assertEqual(resolved["model"], "test-model")
-            self.assertEqual(resolved["provider"], "custom")
-            self.assertEqual(resolved["base_url"], "http://local.example/v1")
-            self.assertEqual(resolved["api_key"], "dummy")
-            self.assertEqual(resolved["api_mode"], "chat_completions")
+            self.assertEqual(resolved["model"], 'test-model')
 
 
 class TestDelegateTask(unittest.TestCase):
@@ -375,9 +371,37 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], "copilot-acp")
             self.assertEqual(kwargs["base_url"], "acp://copilot")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["model"], "google/gemma-3")
             self.assertEqual(kwargs["home_id"], "coder")
             self.assertEqual(kwargs["profile_name"], "coder")
             self.assertEqual(kwargs["transport_kind"], "acp")
+
+    @patch("tools.delegate_tool._resolve_profile_runtime")
+    def test_profile_model_wins_over_delegation_model_hint(self, mock_profile_runtime):
+        parent = _make_mock_parent(depth=0)
+        mock_profile_runtime.return_value = {
+            "home_id": "coder",
+            "profile_name": "coder",
+            "model": "profile-model",
+        }
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Use coder profile",
+                context=None,
+                toolsets=["terminal", "file"],
+                model="delegation-model",
+                max_iterations=10,
+                parent_agent=parent,
+                profile="coder",
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["model"], "profile-model")
 
     def test_top_level_generic_acp_command_uses_acp_transport(self):
         parent = _make_mock_parent(depth=0)
