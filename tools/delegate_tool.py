@@ -981,17 +981,22 @@ def _build_child_agent(
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
     # so we must derive effective toolsets from the parent's loaded tools.
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
-
-        parent_toolsets = {
+    import model_tools
+    derived_parent_toolsets = set()
+    if parent_agent and hasattr(parent_agent, "valid_tool_names"):
+        # Derive from the parent's actual loaded tools first. This preserves
+        # platform/tool config and avoids widening delegated ACP workers just
+        # because parent_enabled is None ("all tools").
+        derived_parent_toolsets = {
             ts
-            for name in parent_agent.valid_tool_names
+            for name in (getattr(parent_agent, "valid_tool_names", None) or [])
             if (ts := model_tools.get_toolset_for_tool(name)) is not None
         }
+
+    if derived_parent_toolsets:
+        parent_toolsets = derived_parent_toolsets
+    elif parent_enabled is not None:
+        parent_toolsets = set(parent_enabled)
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
@@ -1004,7 +1009,7 @@ def _build_child_agent(
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
     elif parent_agent and parent_enabled is not None:
-        child_toolsets = _strip_blocked_tools(parent_enabled)
+        child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     elif parent_toolsets:
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
     else:

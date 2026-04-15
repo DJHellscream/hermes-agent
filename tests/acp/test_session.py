@@ -502,4 +502,6 @@ class TestPersistence:
             state = manager.create_session(cwd="/delegated")
 
         assert captured["enabled_toolsets"] == ["terminal", "file"]
+        assert captured["skip_context_files"] is True
+        assert captured["skip_memory"] is True
         assert state.agent.enabled_toolsets == ["terminal", "file"]

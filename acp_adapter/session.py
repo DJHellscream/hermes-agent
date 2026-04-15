@@ -574,13 +574,14 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
         delegated_enabled_toolsets = _parse_toolset_env("HERMES_ACP_ENABLED_TOOLSETS_JSON")
-        if delegated_enabled_toolsets is None:
+        is_delegated_worker = delegated_enabled_toolsets is not None
+        if is_delegated_worker:
+            enabled_toolsets = delegated_enabled_toolsets
+        else:
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 ["hermes-acp"],
                 mcp_server_names=configured_mcp_servers,
             )
-        else:
-            enabled_toolsets = delegated_enabled_toolsets
 
         kwargs = {
             "platform": "acp",
@@ -588,6 +589,8 @@ class SessionManager:
             "quiet_mode": True,
             "session_id": session_id,
             "model": model or default_model,
+            "skip_context_files": is_delegated_worker,
+            "skip_memory": is_delegated_worker,
         }
 
         try:

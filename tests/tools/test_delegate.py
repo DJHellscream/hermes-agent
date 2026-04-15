@@ -371,7 +371,10 @@ class TestDelegateTask(unittest.TestCase):
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["acp_command"], "hermes")
             self.assertEqual(kwargs["acp_args"], ["--profile", "coder", "acp"])
-            self.assertEqual(kwargs["acp_env"]["HERMES_ACP_ENABLED_TOOLSETS_JSON"], json.dumps(["terminal", "file", "web"]))
+            self.assertEqual(
+                json.loads(kwargs["acp_env"]["HERMES_ACP_ENABLED_TOOLSETS_JSON"]),
+                ["file", "terminal", "web"],
+            )
             self.assertEqual(kwargs["provider"], "copilot-acp")
             self.assertEqual(kwargs["base_url"], "acp://copilot")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
@@ -379,6 +382,39 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["home_id"], "coder")
             self.assertEqual(kwargs["profile_name"], "coder")
             self.assertEqual(kwargs["transport_kind"], "acp")
+
+    @patch("tools.delegate_tool._resolve_profile_runtime")
+    def test_profile_child_from_acp_parent_strips_blocked_composite_tools(self, mock_profile_runtime):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["hermes-acp"]
+        parent.valid_tool_names = [
+            "terminal", "process",
+            "read_file", "write_file", "patch", "search_files",
+            "delegate_task", "memory", "execute_code",
+        ]
+        mock_profile_runtime.return_value = {
+            "home_id": "coder",
+            "profile_name": "coder",
+            "model": "google/gemma-3",
+        }
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Use coder profile", profile="coder", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(
+                json.loads(kwargs["acp_env"]["HERMES_ACP_ENABLED_TOOLSETS_JSON"]),
+                ["file", "terminal"],
+            )
 
     @patch("tools.delegate_tool._resolve_profile_runtime")
     def test_profile_model_wins_over_delegation_model_hint(self, mock_profile_runtime):
