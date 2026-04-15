@@ -10,6 +10,21 @@ Hermes can spawn isolated child agents to work on tasks in parallel. Each subage
 
 For the full feature reference, see [Subagent Delegation](/docs/user-guide/features/delegation).
 
+## Launch Patterns at a Glance
+
+`delegate_task` is now best thought of as one abstraction with three launch styles:
+
+- Standard subagent — no ACP overrides, just `goal/context/toolsets`
+- Profile-backed Hermes worker — `profile="worker-name"`, which Hermes normalizes to `hermes --profile <worker-name> acp`
+- Generic ACP subprocess — `acp_command/acp_args` for non-Hermes ACP tools like Claude Code or Copilot
+
+A useful rule:
+- use `profile` when you want another Hermes worker by name
+- use `acp_command/acp_args` when you want some other ACP-capable subprocess
+- use `toolsets` to define the delegated worker's capability boundary
+
+Choosing a profile does not silently widen tool access beyond the delegated `toolsets`.
+
 ---
 
 ## When to Delegate

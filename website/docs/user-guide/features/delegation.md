@@ -8,6 +8,86 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, restricted toolsets, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
+## Launch Modes
+
+`delegate_task` supports three distinct patterns:
+
+1. Standard subagent
+   - Pass `goal`, `context`, and optional `toolsets`.
+   - Hermes runs a child inside the current runtime family.
+
+2. Profile-backed Hermes worker
+   - Pass `profile="worker-name"`.
+   - Hermes launches `hermes --profile <worker-name> acp`.
+   - The child uses that profile's runtime, home, auth, and profile-local configuration.
+
+3. Generic ACP subprocess
+   - Pass `acp_command` / `acp_args`.
+   - Use this for non-Hermes ACP agents such as Claude Code, Copilot, or other ACP-capable subprocesses.
+
+## Profile vs ACP Overrides
+
+Use `profile` when you want another Hermes worker by name:
+
+```python
+delegate_task(
+    goal="Fix the failing tests",
+    context="Project at /home/user/myproject. Run pytest tests/auth/ -q.",
+    toolsets=["terminal", "file"],
+    profile="coder"
+)
+```
+
+This is normalized internally to:
+
+```bash
+hermes --profile coder acp
+```
+
+Use `acp_command` / `acp_args` only when you are targeting a non-Hermes ACP subprocess or need an advanced manual override:
+
+```python
+delegate_task(
+    goal="Review this repository",
+    context="Repo at /home/user/project",
+    toolsets=["terminal", "file"],
+    acp_command="claude",
+    acp_args=["--acp", "--stdio"]
+)
+```
+
+### Why Hermes Drops `--stdio`
+
+For Hermes itself, `acp` is already the ACP stdio server entrypoint. Running:
+
+```bash
+hermes acp
+```
+
+starts the ACP adapter over stdin/stdout directly. Hermes does not need a separate `--stdio` flag for its own ACP mode.
+
+By contrast, many generic ACP tools (for example `claude --acp --stdio`) do need explicit flags to switch into ACP stdio transport mode.
+
+## Toolsets vs Profile Configuration
+
+Profiles choose the worker's runtime and home:
+- model
+- provider
+- base URL
+- auth/env
+- `HERMES_HOME`
+- profile-local config and skills
+
+`toolsets` choose the worker's allowed capabilities.
+
+That distinction is intentional: choosing a profile does not silently widen tool access. If you delegate with:
+
+```python
+toolsets=["terminal", "file"]
+```
+
+then the delegated worker is constrained to that capability boundary even if the selected profile would normally have broader tools available.
+
 ## Single Task
 
 ```python

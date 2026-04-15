@@ -32,6 +32,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _extract_worker_profile_from_acp,
+    _resolve_profile_runtime,
 )
 
 
@@ -48,6 +50,8 @@ def _make_mock_parent(depth=0):
     parent.providers_ignored = None
     parent.providers_order = None
     parent.provider_sort = None
+    parent.enabled_toolsets = None
+    parent.valid_tool_names = []
     parent._session_db = None
     parent._delegate_depth = depth
     parent._active_children = []
@@ -55,6 +59,10 @@ def _make_mock_parent(depth=0):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    parent.acp_command = None
+    parent.acp_args = []
+    parent.home_id = None
+    parent.profile_name = None
     return parent
 
 
@@ -69,11 +77,13 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("tasks", props)
         self.assertIn("context", props)
         self.assertIn("toolsets", props)
+        self.assertIn("profile", props)
         # max_iterations is intentionally NOT exposed to the model — it's
         # config-authoritative via delegation.max_iterations so users get
         # predictable budgets.
         self.assertNotIn("max_iterations", props)
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+        self.assertIn("profile", props["tasks"]["items"]["properties"])
 
 
 class TestChildSystemPrompt(unittest.TestCase):
@@ -93,6 +103,10 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_prompt_allows_exact_output_requests_to_override_summary_format(self):
+        prompt = _build_child_system_prompt("Return only the exact stdout from pwd")
+        self.assertIn("If the task explicitly asks for raw output or an exact format, follow that exact output format instead of adding a summary", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
@@ -106,6 +120,59 @@ class TestStripBlockedTools(unittest.TestCase):
     def test_empty_input(self):
         result = _strip_blocked_tools([])
         self.assertEqual(result, [])
+
+
+class TestACPWorkerProfileDetection(unittest.TestCase):
+    def test_extracts_profile_for_hermes_acp_command(self):
+        profile = _extract_worker_profile_from_acp(
+            "/usr/local/bin/hermes",
+            ["--profile", "superbif-stateless", "acp"],
+        )
+        self.assertEqual(profile, "superbif-stateless")
+
+    def test_extracts_profile_for_hermes_wrapper_name(self):
+        profile = _extract_worker_profile_from_acp(
+            "hermes-custom-wrapper",
+            ["-p", "superbif-stateless", "acp"],
+        )
+        self.assertEqual(profile, "superbif-stateless")
+
+    def test_ignores_non_hermes_command_even_with_profile_flag(self):
+        profile = _extract_worker_profile_from_acp(
+            "python",
+            ["--profile", "not-a-hermes-profile", "something-else"],
+        )
+        self.assertIsNone(profile)
+
+
+class TestACPWorkerProfileRuntime(unittest.TestCase):
+    def test_resolves_profile_runtime_with_env_expansion(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            profile_dir = tmp / ".hermes" / "profiles" / "coder"
+            profile_dir.mkdir(parents=True)
+            (profile_dir / ".env").write_text("PROFILE_BASE_URL=http://local.example/v1\n")
+            (profile_dir / "config.yaml").write_text(
+                "model:\n"
+                "  default: test-model\n"
+                "  provider: custom\n"
+                "  base_url: ${PROFILE_BASE_URL}\n"
+                "  api_key: dummy\n"
+                "  api_mode: chat_completions\n"
+            )
+            with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_dir):
+                resolved = _resolve_profile_runtime("coder")
+
+            self.assertEqual(resolved["home_id"], "coder")
+            self.assertEqual(resolved["profile_name"], "coder")
+            self.assertEqual(resolved["model"], "test-model")
+            self.assertEqual(resolved["provider"], "custom")
+            self.assertEqual(resolved["base_url"], "http://local.example/v1")
+            self.assertEqual(resolved["api_key"], "dummy")
+            self.assertEqual(resolved["api_mode"], "chat_completions")
 
 
 class TestDelegateTask(unittest.TestCase):
@@ -134,6 +201,19 @@ class TestDelegateTask(unittest.TestCase):
         parent = _make_mock_parent()
         result = json.loads(delegate_task(tasks=[{"context": "no goal here"}], parent_agent=parent))
         self.assertIn("error", result)
+
+    def test_conflicting_explicit_profile_and_acp_profile_returns_error(self):
+        parent = _make_mock_parent()
+        result = json.loads(delegate_task(
+            goal="Test profile conflict",
+            profile="coder",
+            acp_command="hermes",
+            acp_args=["--profile", "reviewer", "acp"],
+            parent_agent=parent,
+        ))
+        self.assertIn("error", result)
+        self.assertIn("profile", result["error"].lower())
+        self.assertIn("conflict", result["error"].lower())
 
     @patch("tools.delegate_tool._run_single_child")
     def test_single_task_mode(self, mock_run):
@@ -262,6 +342,69 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], parent.api_key)
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
+
+    @patch("tools.delegate_tool._resolve_profile_runtime")
+    def test_explicit_profile_builds_hermes_acp_child(self, mock_profile_runtime):
+        parent = _make_mock_parent(depth=0)
+        mock_profile_runtime.return_value = {
+            "home_id": "coder",
+            "profile_name": "coder",
+            "model": "google/gemma-3",
+            "provider": "custom",
+            "base_url": "http://coder.example/v1",
+            "api_key": "***",
+            "api_mode": "chat_completions",
+        }
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Use coder profile", profile="coder", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["acp_command"], "hermes")
+            self.assertEqual(kwargs["acp_args"], ["--profile", "coder", "acp"])
+            self.assertEqual(kwargs["acp_env"]["HERMES_ACP_ENABLED_TOOLSETS_JSON"], json.dumps(["terminal", "file", "web"]))
+            self.assertEqual(kwargs["provider"], "copilot-acp")
+            self.assertEqual(kwargs["base_url"], "acp://copilot")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["home_id"], "coder")
+            self.assertEqual(kwargs["profile_name"], "coder")
+            self.assertEqual(kwargs["transport_kind"], "acp")
+
+    def test_top_level_generic_acp_command_uses_acp_transport(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Use external ACP",
+                acp_command="copilot",
+                acp_args=["--acp", "--stdio"],
+                parent_agent=parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["acp_command"], "copilot")
+            self.assertEqual(kwargs["acp_args"], ["--acp", "--stdio"])
+            self.assertEqual(kwargs["provider"], "copilot-acp")
+            self.assertEqual(kwargs["base_url"], "acp://copilot")
+            self.assertEqual(kwargs["api_mode"], "chat_completions")
+            self.assertEqual(kwargs["transport_kind"], "acp")
 
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
