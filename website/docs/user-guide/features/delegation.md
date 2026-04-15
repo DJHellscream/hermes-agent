@@ -6,7 +6,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 # Subagent Delegation
 
-The `delegate_task` tool spawns child AIAgent instances with isolated context, restricted toolsets, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
+The `delegate_task` tool spawns child AIAgent instances with isolated context, restricted toolsets, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final response or summary enters the parent's context. Intermediate tool output is not a guaranteed verbatim relay.
 
 ## Launch Modes
 
@@ -298,7 +298,8 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `execute_code`. Orchestrator subagents retain `delegate_task` but still cannot use the other four.
 - **Interrupt propagation** — interrupting the parent interrupts all active children (including grandchildren under orchestrators)
-- Only the final summary enters the parent's context, keeping token usage efficient
+- Only the final response or summary enters the parent's context, keeping token usage efficient
+- If the parent needs concrete command output or file contents, the child must include them in its final response explicitly
 - Profile-backed Hermes workers use the selected profile's runtime/home/auth. Generic subagents without `profile` continue to inherit the parent's runtime family, and generic ACP subprocesses use the explicitly provided `acp_command` / `acp_args`.
 
 ## Delegation vs execute_code

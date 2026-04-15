@@ -72,6 +72,8 @@ class TestDelegateRequirements(unittest.TestCase):
 
     def test_schema_valid(self):
         self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
+        self.assertIn("final response or summary", DELEGATE_TASK_SCHEMA["description"])
+        self.assertIn("not a guaranteed verbatim relay", DELEGATE_TASK_SCHEMA["description"])
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
@@ -103,9 +105,11 @@ class TestChildSystemPrompt(unittest.TestCase):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
 
-    def test_prompt_allows_exact_output_requests_to_override_summary_format(self):
-        prompt = _build_child_system_prompt("Return only the exact stdout from pwd")
-        self.assertIn("If the task explicitly asks for raw output or an exact format, follow that exact output format instead of adding a summary", prompt)
+    def test_prompt_tells_child_to_include_needed_outputs_in_final_response(self):
+        prompt = _build_child_system_prompt("Return the worker home path")
+        self.assertIn("Include any concrete command output or file contents the parent needs to see in your final response", prompt)
+        self.assertIn("Do not assume intermediate tool output will be relayed verbatim", prompt)
+        self.assertNotIn("If the task explicitly asks for raw output or an exact format", prompt)
 
 
 class TestStripBlockedTools(unittest.TestCase):

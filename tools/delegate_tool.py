@@ -563,8 +563,10 @@ def _build_child_system_prompt(
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
-        "If the task explicitly asks for raw output or an exact format, follow that exact output format instead of adding a summary. "
-        "Otherwise, when finished, provide a clear, concise summary of:\n"
+        "When finished, provide a clear, concise final response for the parent agent. "
+        "Include any concrete command output or file contents the parent needs to see in your final response. "
+        "Do not assume intermediate tool output will be relayed verbatim. "
+        "When useful, briefly cover:\n"
         "- What you did\n"
         "- What you found or accomplished\n"
         "- Any files you created or modified\n"
@@ -572,7 +574,7 @@ def _build_child_system_prompt(
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Be thorough but concise -- your response is returned to the "
-        "parent agent as a summary."
+        "parent agent as the delegated child's final response."
     )
     if role == "orchestrator":
         child_note = (
@@ -2505,8 +2507,8 @@ DELEGATE_TASK_SCHEMA = {
     "description": (
         "Spawn one or more subagents to work on tasks in isolated contexts. "
         "Each subagent gets its own conversation, terminal session, and toolset. "
-        "Only the final summary is returned -- intermediate tool results "
-        "never enter your context window.\n\n"
+        "Only the delegated child's final response or summary is returned -- "
+        "intermediate tool results never enter your context window, and tool output is not a guaranteed verbatim relay.\n\n"
         "THREE LAUNCH PATTERNS:\n"
         "1. Standard subagent: provide 'goal' (+ optional context, toolsets).\n"
         "2. Profile-backed Hermes worker: provide 'profile' (+ optional toolsets); Hermes launches `hermes --profile <name> acp`.\n"

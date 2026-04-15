@@ -6,7 +6,7 @@ description: "When and how to use subagent delegation — patterns for parallel 
 
 # Delegation & Parallel Work
 
-Hermes can spawn isolated child agents to work on tasks in parallel. Each subagent gets its own conversation, terminal session, and toolset. Only the final summary comes back — intermediate tool calls never enter your context window.
+Hermes can spawn isolated child agents to work on tasks in parallel. Each subagent gets its own conversation, terminal session, and toolset. Only the child's final response or summary comes back — intermediate tool calls never enter your context window, and they are not forwarded verbatim.
 
 For the full feature reference, see [Subagent Delegation](/docs/user-guide/features/delegation).
 
