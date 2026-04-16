@@ -41,7 +41,7 @@ def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
     parent = MagicMock()
     parent.base_url = "https://openrouter.ai/api/v1"
-    parent.api_key="***"
+    parent.api_key="test-key"
     parent.provider = "openrouter"
     parent.api_mode = "chat_completions"
     parent.model = "anthropic/claude-sonnet-4"
@@ -322,7 +322,7 @@ class TestDelegateTask(unittest.TestCase):
     def test_child_inherits_runtime_credentials(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://chatgpt.com/backend-api/codex"
-        parent.api_key="***"
+        parent.api_key="test-key"
         parent.provider = "openai-codex"
         parent.api_mode = "codex_responses"
 
@@ -352,7 +352,7 @@ class TestDelegateTask(unittest.TestCase):
             "model": "google/gemma-3",
             "provider": "custom",
             "base_url": "http://coder.example/v1",
-            "api_key": "***",
+            "api_key": "test-key",
             "api_mode": "chat_completions",
         }
 
