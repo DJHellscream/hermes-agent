@@ -114,7 +114,7 @@ def test_create_chat_completion_surfaces_runtime_metadata_from_acp_meta():
             },
             {
                 "provider": "custom",
-                "base_url": "http://superbif:8000/v1",
+                "base_url": "http://worker.example/v1",
                 "api_mode": "chat_completions",
             },
         ),
@@ -125,5 +125,5 @@ def test_create_chat_completion_surfaces_runtime_metadata_from_acp_meta():
         )
 
     assert getattr(resp, "hermes_provider", None) == "custom"
-    assert getattr(resp, "hermes_base_url", None) == "http://superbif:8000/v1"
+    assert getattr(resp, "hermes_base_url", None) == "http://worker.example/v1"
     assert getattr(resp, "hermes_api_mode", None) == "chat_completions"

@@ -351,7 +351,7 @@ class TestCLIAccountingReport:
                 parent_run_id="root-run",
                 local_session_id="session-child",
                 home_id="worker",
-                profile_name="superbif-stateless",
+                profile_name="worker-profile",
                 launch_kind="delegate_task",
                 transport_kind="acp",
                 started_at=1_700_000_010.0,
@@ -374,9 +374,9 @@ class TestCLIAccountingReport:
                 root_run_id="root-run",
                 local_session_id="session-child",
                 home_id="worker",
-                profile_name="superbif-stateless",
+                profile_name="worker-profile",
                 provider="custom",
-                base_url="http://superbif:8000/v1",
+                base_url="http://worker.example/v1",
                 model="google/gemma-4-26B-A4B-it",
                 input_tokens=40,
                 output_tokens=4,
@@ -399,13 +399,13 @@ class TestCLIAccountingReport:
             assert "Whole task" in output
             assert "Breakdown by provider | model | base_url | api_mode" in output
             assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
-            assert "custom | google/gemma-4-26B-A4B-it | http://superbif:8000/v1" in output
+            assert "custom | google/gemma-4-26B-A4B-it | http://worker.example/v1" in output
             assert "cache-write 3" in output
             assert "reasoning 2" in output
             assert "Run tree" in output
             assert "root     root-run" in output
             assert "child    child-ru" in output
-            assert "profile=superbif-stateless" in output
+            assert "profile=worker-profile" in output
             assert "transport=acp" in output
             assert "launch=delegate_task" in output
             assert "Session links" in output
@@ -508,7 +508,7 @@ class TestCLIAccountingReport:
                 local_session_id="session-root",
                 home_id="default",
                 provider="custom",
-                base_url="http://superbif:8000/v1",
+                base_url="http://worker.example/v1",
                 model="google/gemma-4-26B-A4B-it",
                 input_tokens=7,
                 output_tokens=2,
@@ -523,7 +523,7 @@ class TestCLIAccountingReport:
             assert "Scope: current session" in output
             assert "Root runs: 2" in output
             assert "openai-codex | gpt-5.4 | https://chatgpt.com/backend-api/codex" in output
-            assert "custom | google/gemma-4-26B-A4B-it | http://superbif:8000/v1" in output
+            assert "custom | google/gemma-4-26B-A4B-it | http://worker.example/v1" in output
             assert "in 12  out 3  total 15" in output
         finally:
             session_db.close()

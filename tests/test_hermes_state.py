@@ -490,7 +490,7 @@ class TestAccountingLedger:
             root_run_id="root-run",
             home_id="default",
             provider="custom",
-            base_url="http://superbif:8000/v1",
+            base_url="http://worker.example/v1",
             model="google/gemma-4-26B-A4B-it",
             profile_name="worker",
             input_tokens=40,
@@ -504,7 +504,7 @@ class TestAccountingLedger:
         assert by_provider["openai-codex"]["input_tokens"] == 100
         assert by_provider["openai-codex"]["exact_event_count"] == 1
         assert by_provider["custom"]["unknown_event_count"] == 1
-        assert by_provider["custom"]["base_url"] == "http://superbif:8000/v1"
+        assert by_provider["custom"]["base_url"] == "http://worker.example/v1"
 
     def test_get_task_usage_breakdown_splits_same_route_by_api_mode(self, accounting_db):
         accounting_db.create_agent_run(
@@ -723,7 +723,7 @@ class TestSessionLifecycle:
             role="assistant",
             content="second",
             provider="custom",
-            base_url="http://superbif:8000/v1",
+            base_url="http://worker.example/v1",
             model="google/gemma-4-26B-A4B-it",
             api_mode="chat_completions",
             input_tokens=0,

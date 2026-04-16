@@ -480,7 +480,7 @@ class TestPrompt:
             "output_tokens": 45,
             "total_tokens": 168,
             "actual_provider": "custom",
-            "actual_base_url": "http://superbif:8000/v1",
+            "actual_base_url": "http://worker.example/v1",
             "actual_api_mode": "chat_completions",
         })
 
@@ -495,7 +495,7 @@ class TestPrompt:
         assert resp.field_meta == {
             "hermesRuntime": {
                 "provider": "custom",
-                "base_url": "http://superbif:8000/v1",
+                "base_url": "http://worker.example/v1",
                 "api_mode": "chat_completions",
             }
         }

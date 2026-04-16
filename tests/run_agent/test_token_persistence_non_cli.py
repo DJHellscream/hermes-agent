@@ -407,7 +407,7 @@ def test_acp_run_uses_actual_runtime_metadata_when_response_provides_it(tmp_path
             model="google/gemma-4-26B-A4B-it",
             usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8),
             hermes_provider="custom",
-            hermes_base_url="http://superbif:8000/v1",
+            hermes_base_url="http://worker.example/v1",
             hermes_api_mode="chat_completions",
         )
 
@@ -415,20 +415,20 @@ def test_acp_run_uses_actual_runtime_metadata_when_response_provides_it(tmp_path
 
         assert result["final_response"] == "done"
         assert result["actual_provider"] == "custom"
-        assert result["actual_base_url"] == "http://superbif:8000/v1"
+        assert result["actual_base_url"] == "http://worker.example/v1"
         assert result["actual_api_mode"] == "chat_completions"
 
         run = accounting_db.get_agent_run(agent.run_id)
         assert run is not None
         assert run["provider_hint"] == "custom"
-        assert run["base_url_hint"] == "http://superbif:8000/v1"
+        assert run["base_url_hint"] == "http://worker.example/v1"
 
         events = accounting_db.get_usage_events(run_id=agent.run_id)
         assert len(events) == 1
         event = events[0]
         assert event["usage_status"] == "exact"
         assert event["provider"] == "custom"
-        assert event["base_url"] == "http://superbif:8000/v1"
+        assert event["base_url"] == "http://worker.example/v1"
         assert event["api_mode"] == "chat_completions"
         assert event["input_tokens"] == 5
         assert event["output_tokens"] == 3
