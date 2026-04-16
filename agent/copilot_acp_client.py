@@ -51,6 +51,18 @@ def _coerce_timeout_seconds(timeout: Any) -> float:
         return _DEFAULT_TIMEOUT_SECONDS
 
 
+
+def _coerce_prompt_timeout_override(timeout: Any) -> float | None:
+    if timeout is None:
+        return None
+    try:
+        parsed = float(timeout)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
@@ -346,6 +358,7 @@ class CopilotACPClient:
         acp_args: list[str] | None = None,
         acp_env: dict[str, str] | None = None,
         acp_cwd: str | None = None,
+        acp_prompt_timeout_seconds: float | None = None,
         command: str | None = None,
         args: list[str] | None = None,
         **_: Any,
@@ -357,6 +370,7 @@ class CopilotACPClient:
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_env = {str(k): str(v) for k, v in dict(acp_env or {}).items()}
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._acp_prompt_timeout_seconds = _coerce_prompt_timeout_override(acp_prompt_timeout_seconds)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -395,25 +409,12 @@ class CopilotACPClient:
             tools=tools,
             tool_choice=tool_choice,
         )
-        # Normalise timeout: run_agent.py may pass an httpx.Timeout object
-        # (used natively by the OpenAI SDK) rather than a plain float.
-        if timeout is None:
-            _effective_timeout = _DEFAULT_TIMEOUT_SECONDS
-        elif isinstance(timeout, (int, float)):
-            _effective_timeout = float(timeout)
-        else:
-            # httpx.Timeout or similar — pick the largest component so the
-            # subprocess has enough wall-clock time for the full response.
-            _candidates = [
-                getattr(timeout, attr, None)
-                for attr in ("read", "write", "connect", "pool", "timeout")
-            ]
-            _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
-            _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
-
+        effective_timeout_seconds = self._acp_prompt_timeout_seconds
+        if effective_timeout_seconds is None:
+            effective_timeout_seconds = _coerce_timeout_seconds(timeout)
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
-            timeout_seconds=_effective_timeout,
+            timeout_seconds=effective_timeout_seconds,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)

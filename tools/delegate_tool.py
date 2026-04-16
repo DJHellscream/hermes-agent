@@ -886,10 +886,22 @@ def _resolve_profile_runtime(profile_name: str) -> dict:
         model_cfg = cfg.get("model") or {}
         if isinstance(model_cfg, str):
             model_cfg = {"default": model_cfg}
+
+        timeout_seconds = None
+        timeout_raw = env_overlay.get("HERMES_ACP_PROMPT_TIMEOUT") or env_overlay.get("HERMES_API_TIMEOUT")
+        if timeout_raw not in (None, ""):
+            try:
+                parsed_timeout = float(timeout_raw)
+                if parsed_timeout > 0:
+                    timeout_seconds = parsed_timeout
+            except (TypeError, ValueError):
+                timeout_seconds = None
+
         return {
             "profile_name": profile_name,
             "home_id": profile_name,
             "model": str(model_cfg.get("default") or "").strip() or None,
+            "acp_prompt_timeout_seconds": timeout_seconds,
         }
     except Exception:
         logger.debug("Could not resolve profile runtime for ACP worker", exc_info=True)
@@ -1090,6 +1102,7 @@ def _build_child_agent(
 
     child_home_id = getattr(parent_agent, "home_id", None)
     child_profile_name = getattr(parent_agent, "profile_name", None)
+    effective_acp_prompt_timeout_seconds = None
 
     worker_profile = str(profile or "").strip() or None
     if worker_profile:
@@ -1103,6 +1116,15 @@ def _build_child_agent(
         effective_model = profile_runtime.get("model") or effective_model
         child_home_id = profile_runtime.get("home_id") or worker_profile
         child_profile_name = profile_runtime.get("profile_name") or worker_profile
+        timeout_hint = profile_runtime.get("acp_prompt_timeout_seconds")
+        if timeout_hint in (None, ""):
+            timeout_hint = os.getenv("HERMES_API_TIMEOUT", 1800.0)
+        try:
+            parsed_timeout = float(timeout_hint)
+            if parsed_timeout > 0:
+                effective_acp_prompt_timeout_seconds = parsed_timeout
+        except (TypeError, ValueError):
+            effective_acp_prompt_timeout_seconds = 1800.0
     elif override_provider and not override_acp_command:
         # When delegation.provider is set (for example minimax-cn), the
         # subagent must use direct API calls rather than inheriting an ACP
@@ -1154,6 +1176,7 @@ def _build_child_agent(
         acp_command=effective_acp_command,
         acp_args=effective_acp_args,
         acp_env=effective_acp_env,
+        acp_prompt_timeout_seconds=effective_acp_prompt_timeout_seconds,
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,

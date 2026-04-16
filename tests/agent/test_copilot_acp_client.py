@@ -249,6 +249,29 @@ def test_create_chat_completion_defaults_timeout_when_missing(monkeypatch):
     assert captured["timeout_seconds"] == _DEFAULT_TIMEOUT_SECONDS
 
 
+def test_create_chat_completion_prefers_explicit_acp_prompt_timeout(monkeypatch):
+    client = CopilotACPClient(
+        acp_command="copilot",
+        acp_args=["--acp", "--stdio"],
+        acp_prompt_timeout_seconds=777.0,
+    )
+    captured: dict[str, float] = {}
+
+    def fake_run_prompt(prompt_text: str, *, timeout_seconds: float):
+        captured["timeout_seconds"] = timeout_seconds
+        return "delegate smoke ok", ""
+
+    monkeypatch.setattr(client, "_run_prompt", fake_run_prompt)
+
+    client.chat.completions.create(
+        model="google/gemma-4-26B-A4B-it",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout=httpx.Timeout(connect=30.0, read=120.0, write=1800.0, pool=30.0),
+    )
+
+    assert captured["timeout_seconds"] == 777.0
+
+
 def test_aiagent_accepts_non_streaming_copilot_acp_chat_completion(monkeypatch):
     from run_agent import AIAgent
 

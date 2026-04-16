@@ -354,6 +354,7 @@ class TestDelegateTask(unittest.TestCase):
             "base_url": "http://coder.example/v1",
             "api_key": "test-key",
             "api_mode": "chat_completions",
+            "acp_prompt_timeout_seconds": 777.0,
         }
 
         with patch("hermes_cli.profiles.profile_exists", return_value=True), \
@@ -375,6 +376,7 @@ class TestDelegateTask(unittest.TestCase):
                 json.loads(kwargs["acp_env"]["HERMES_ACP_ENABLED_TOOLSETS_JSON"]),
                 ["file", "terminal", "web"],
             )
+            self.assertEqual(kwargs["acp_prompt_timeout_seconds"], 777.0)
             self.assertEqual(kwargs["provider"], "copilot-acp")
             self.assertEqual(kwargs["base_url"], "acp://copilot")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
