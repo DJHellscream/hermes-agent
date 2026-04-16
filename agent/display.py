@@ -1050,8 +1050,8 @@ def get_cute_tool_message(
         profile_names = _delegate_profile_names_from_result(result) or _delegate_profile_names_from_args(args)
         profile_tag = _delegate_profile_tag(profile_names)
         if tasks and isinstance(tasks, list):
-            return _wrap(f"┊ 🔀 delegate  {profile_tag}{len(tasks)} parallel tasks  {dur}")
-        return _wrap(f"┊ 🔀 delegate  {profile_tag}{_trunc(args.get('goal', ''), 35)}  {dur}")
+            return _wrap(f"┊ 🔀 delegate {profile_tag}{len(tasks)} parallel tasks  {dur}")
+        return _wrap(f"┊ 🔀 delegate {profile_tag}{_trunc(args.get('goal', ''), 35)}  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
