@@ -1242,6 +1242,22 @@ def _build_child_agent(
     return child
 
 
+def _child_identity_metadata(child: Any) -> Dict[str, Any]:
+    """Return stable child identity fields for success, error, and timeout rows."""
+    _model = getattr(child, "model", None)
+    _home_id = getattr(child, "home_id", None)
+    _profile_name = getattr(child, "profile_name", None)
+    _transport_kind = getattr(child, "transport_kind", None)
+    _launch_kind = getattr(child, "launch_kind", None)
+    return {
+        "model": _model if isinstance(_model, str) else None,
+        "home_id": _home_id if isinstance(_home_id, str) else None,
+        "profile_name": _profile_name if isinstance(_profile_name, str) else None,
+        "transport_kind": _transport_kind if isinstance(_transport_kind, str) else None,
+        "launch_kind": _launch_kind if isinstance(_launch_kind, str) else None,
+    }
+
+
 def _dump_subagent_timeout_diagnostic(
     *,
     child: Any,
@@ -1668,6 +1684,7 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                **_child_identity_metadata(child),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -1747,11 +1764,6 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
-        _model = getattr(child, "model", None)
-        _home_id = getattr(child, "home_id", None)
-        _profile_name = getattr(child, "profile_name", None)
-        _transport_kind = getattr(child, "transport_kind", None)
-        _launch_kind = getattr(child, "launch_kind", None)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -1759,11 +1771,7 @@ def _run_single_child(
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
-            "model": _model if isinstance(_model, str) else None,
-            "home_id": _home_id if isinstance(_home_id, str) else None,
-            "profile_name": _profile_name if isinstance(_profile_name, str) else None,
-            "transport_kind": _transport_kind if isinstance(_transport_kind, str) else None,
-            "launch_kind": _launch_kind if isinstance(_launch_kind, str) else None,
+            **_child_identity_metadata(child),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -1912,6 +1920,7 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            **_child_identity_metadata(child),
             "_child_role": getattr(child, "_delegate_role", None),
         }
 

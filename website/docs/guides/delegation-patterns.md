@@ -26,7 +26,9 @@ A useful rule:
 Choosing a profile does not silently widen tool access beyond the delegated `toolsets`.
 
 :::note Hermes workers vs generic ACP subprocesses
-For profile-backed Hermes workers, the delegated toolset boundary is enforced on the worker side too. For arbitrary ACP subprocesses, Hermes still limits the tool schema it hands over, but the subprocess may expose additional ACP-native capabilities of its own. Treat generic ACP backends as trusted integrations rather than strict sandboxes.
+For profile-backed Hermes workers, the delegated toolset boundary is enforced on the worker side too. Profile-backed workers skip parent context files and parent memory injection, so pass required context explicitly. They launch through `hermes --profile <name> acp`, which requires `hermes` on the parent's `PATH`. Worker ACP permission requests are denied by default instead of prompting the parent interactively.
+
+For arbitrary ACP subprocesses, Hermes still limits the tool schema it hands over, but the subprocess may expose additional ACP-native capabilities of its own. Treat generic ACP backends as trusted integrations rather than strict sandboxes.
 :::
 
 ---

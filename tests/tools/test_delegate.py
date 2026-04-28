@@ -659,6 +659,30 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
+    def test_error_result_preserves_identity_metadata(self):
+        """Errored children should keep the same identity fields as successful rows."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "profile-model"
+            mock_child.home_id = "coder"
+            mock_child.profile_name = "coder"
+            mock_child.transport_kind = "acp"
+            mock_child.launch_kind = "delegate_task"
+            mock_child.run_conversation.side_effect = RuntimeError("boom")
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test error metadata", parent_agent=parent))
+            entry = result["results"][0]
+
+            self.assertEqual(entry["status"], "error")
+            self.assertEqual(entry["model"], "profile-model")
+            self.assertEqual(entry["home_id"], "coder")
+            self.assertEqual(entry["profile_name"], "coder")
+            self.assertEqual(entry["transport_kind"], "acp")
+            self.assertEqual(entry["launch_kind"], "delegate_task")
+
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""
         parent = _make_mock_parent(depth=0)
