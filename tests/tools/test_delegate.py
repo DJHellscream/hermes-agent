@@ -438,6 +438,7 @@ class TestDelegateTask(unittest.TestCase):
                 toolsets=["terminal", "file"],
                 model="delegation-model",
                 max_iterations=10,
+                task_count=1,
                 parent_agent=parent,
                 profile="coder",
             )
